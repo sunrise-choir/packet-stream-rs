@@ -104,21 +104,21 @@ impl PacketType for PacketTypeJson {
 }
 
 /// A Future used to write an entire packet into an AsyncWrite.
-struct WritePacket<W, B> {
+pub struct WritePacket<W, B> {
     write: Option<W>,
     packet: B,
     state: WritePacketState,
 }
 
 impl<W, B: AsRef<[u8]>> WritePacket<W, B> {
-    /// Creates a new WritePacket future. Panics if the buffer is larger than
+    /// Create a new WritePacket future. Panics if the buffer is larger than
     /// the maximum packet size `std::u32::MAX`.
     ///
     /// The flags are set via the type-level parameters T, S and E.
-    fn new<S: PacketStream, E: PacketEnd, T: PacketType>(write: W,
-                                                         packet: B,
-                                                         id: PacketId)
-                                                         -> WritePacket<W, B> {
+    pub fn new<S: PacketStream, E: PacketEnd, T: PacketType>(write: W,
+                                                             packet: B,
+                                                             id: PacketId)
+                                                             -> WritePacket<W, B> {
         if packet.as_ref().len() > MAX as usize {
             panic!("Packet too large for packet-stream");
         }
@@ -152,7 +152,6 @@ impl<W: AsyncWrite, B: AsRef<[u8]>> Future for WritePacket<W, B> {
         match self.state {
             WritePacketState::WriteFlags(flags, id) => {
                 loop {
-                    println!("WriteFlagsLoop, flags: {}", flags);
                     match w.write(&[flags]) {
                         Ok(0) => {
                             return Err(Error::new(WriteZero, "failed to write packet flags"));
@@ -173,24 +172,15 @@ impl<W: AsyncWrite, B: AsRef<[u8]>> Future for WritePacket<W, B> {
             }
 
             WritePacketState::WriteLength(id, initial_offset) => {
-                let len = (self.packet.as_ref().len() as u32).to_be();
-                println!("len: {}", len);
                 let len_bytes =
                     unsafe { transmute::<_, [u8; 4]>((self.packet.as_ref().len() as u32).to_be()) };
                 let mut offset = initial_offset;
                 while offset < 4 {
-                    println!("WriteLengthLoop {}", offset);
                     match w.write(&len_bytes[offset as usize..]) {
                         Ok(0) => {
                             return Err(Error::new(WriteZero, "failed to write packet length"));
                         }
                         Ok(written) => {
-                            println!("wrote length: {} {} {} {} from offset {}",
-                                     unsafe { transmute::<_, [u8; 4]>(len)[0] },
-                                     unsafe { transmute::<_, [u8; 4]>(len)[1] },
-                                     unsafe { transmute::<_, [u8; 4]>(len)[2] },
-                                     unsafe { transmute::<_, [u8; 4]>(len)[3] },
-                                     offset);
                             offset += written as u8;
                             self.state = WritePacketState::WriteLength(id, offset);
                         }
@@ -212,14 +202,6 @@ impl<W: AsyncWrite, B: AsRef<[u8]>> Future for WritePacket<W, B> {
                 let id_bytes = unsafe { transmute::<_, [u8; 4]>(id) };
                 let mut offset = initial_offset;
                 while offset < 4 {
-                    println!("WriteIdLoop, offset: {}, id_be: {}, id_native: {}, {} {} {} {}",
-                             offset,
-                             id,
-                             id.to_be(),
-                             id_bytes[0],
-                             id_bytes[1],
-                             id_bytes[2],
-                             id_bytes[3]);
                     match w.write(&id_bytes[offset as usize..]) {
                         Ok(0) => {
                             return Err(Error::new(WriteZero, "failed to write packet id"));
@@ -245,7 +227,6 @@ impl<W: AsyncWrite, B: AsRef<[u8]>> Future for WritePacket<W, B> {
             WritePacketState::WritePacket(initial_offset) => {
                 let mut offset = initial_offset;
                 while (offset as usize) < self.packet.as_ref().len() {
-                    println!("WritePacketLoop {}", offset);
                     match w.write(&self.packet.as_ref()[offset as usize..]) {
                         Ok(0) => {
                             return Err(Error::new(WriteZero, "failed to write packet data"));
@@ -269,12 +250,13 @@ impl<W: AsyncWrite, B: AsRef<[u8]>> Future for WritePacket<W, B> {
     }
 }
 
-// Future to write an end of packet-stream header. The state is how many zero
-// bytes have already been written.
-struct WriteZeros<W>(u8, Option<W>);
+/// Future to write an end of packet-stream header.
+pub struct WriteZeros<W>(u8, Option<W>);
+//The state is how many zero bytes have already been written.
 
 impl<W> WriteZeros<W> {
-    fn new(w: W) -> WriteZeros<W> {
+    /// Create a new WriteZeros future.
+    pub fn new(w: W) -> WriteZeros<W> {
         WriteZeros(0, Some(w))
     }
 }
@@ -312,26 +294,70 @@ impl<W: AsyncWrite> Future for WriteZeros<W> {
     }
 }
 
-struct DecodedPacket {
+/// A packet decoded an AsyncRead.
+pub struct DecodedPacket {
     flags: u8,
     id: PacketId,
     bytes: Vec<u8>,
 }
 
 impl DecodedPacket {
-    // TODO methods returning booleans for checking flags
-    // TODO other getters
+    /// Returns true if the stream flag of the packet is set.
+    pub fn is_stream_packet(&self) -> bool {
+        self.flags & STREAM != 0
+    }
+
+    /// Returns true if the end flag of the packet is set.
+    pub fn is_end_packet(&self) -> bool {
+        self.flags & END != 0
+    }
+
+    /// Returns true if the type flags signal a buffer.
+    pub fn is_buffer_packet(&self) -> bool {
+        self.flags & TYPE == TYPE_BINARY
+    }
+
+    /// Returns true if the type flags signal a string.
+    pub fn is_string_packet(&self) -> bool {
+        self.flags & TYPE == TYPE_STRING
+    }
+
+    /// Returns true if the type flags signal json.
+    pub fn is_json_packet(&self) -> bool {
+        self.flags & TYPE == TYPE_JSON
+    }
+
+    /// Returns the id of the packet.
+    pub fn id(&self) -> PacketId {
+        self.id
+    }
+
+    /// Returns a reference to the packet's data.
+    pub fn data(&self) -> &Vec<u8> {
+        &self.bytes
+    }
+
+    /// Returns a mutable reference to the packet's data.
+    pub fn data_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.bytes
+    }
+
+    /// Consumes the packet and gives ownership of its data.
+    pub fn into_data(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
-// A Future used to read a packet from an AsyncRead
-struct ReadPacket<R> {
+/// A Future used to read a packet from an AsyncRead
+pub struct ReadPacket<R> {
     read: Option<R>,
     packet: Option<DecodedPacket>,
     state: ReadPacketState,
 }
 
 impl<R> ReadPacket<R> {
-    fn new(read: R) -> ReadPacket<R> {
+    /// Create a new ReadPacket future to read a packet from an AsyncRead.
+    pub fn new(read: R) -> ReadPacket<R> {
         ReadPacket {
             read: Some(read),
             packet: Some(DecodedPacket {
@@ -352,7 +378,8 @@ enum ReadPacketState {
 }
 
 impl<R: AsyncRead> Future for ReadPacket<R> {
-    type Item = (Option<DecodedPacket>, R); // `None` if encountered a zeros header
+    /// Yields `(None, read)` when encountering an end-of-packet-stream header.
+    type Item = (Option<DecodedPacket>, R);
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
@@ -365,7 +392,6 @@ impl<R: AsyncRead> Future for ReadPacket<R> {
             ReadPacketState::ReadFlags => {
                 let mut read_buf = [0u8; 1];
                 loop {
-                    println!("ReadFlagsLoop");
                     match r.read(&mut read_buf) {
                         Ok(0) => {
                             return Err(Error::new(UnexpectedEof, "failed to read packet flags"));
@@ -378,7 +404,6 @@ impl<R: AsyncRead> Future for ReadPacket<R> {
                             }
 
                             self.state = ReadPacketState::ReadLength(0, [0; 4]);
-                            println!("read flags: {}", packet.flags);
                             self.read = Some(r);
                             self.packet = Some(packet);
                             return self.poll();
@@ -397,7 +422,6 @@ impl<R: AsyncRead> Future for ReadPacket<R> {
             ReadPacketState::ReadLength(initial_offset, mut length_buf) => {
                 let mut offset = initial_offset;
                 while offset < 4 {
-                    println!("ReadLengthLoop {}", offset);
                     match r.read(&mut length_buf[offset as usize..]) {
                         Ok(0) => {
                             return Err(Error::new(UnexpectedEof, "failed to read packet length"));
@@ -426,7 +450,6 @@ impl<R: AsyncRead> Future for ReadPacket<R> {
             ReadPacketState::ReadId(initial_offset, length, mut id_buf) => {
                 let mut offset = initial_offset;
                 while offset < 4 {
-                    println!("ReadIdLoop {}", offset);
                     match r.read(&mut id_buf[offset as usize..]) {
                         Ok(0) => {
                             return Err(Error::new(UnexpectedEof, "failed to read packet id"));
@@ -445,17 +468,8 @@ impl<R: AsyncRead> Future for ReadPacket<R> {
                     }
                 }
 
-                println!("left ReadId loop");
-
                 packet.id = i32::from_be(unsafe { transmute::<[u8; 4], i32>(id_buf) });
 
-                println!("length: {}, id: {}, flags: {}",
-                         length,
-                         packet.id,
-                         packet.flags);
-                println!("\n\n");
-
-                // TODO check for zero lenth as error if not a final header
                 if (length == 0) && (packet.id == 0) && (packet.flags == 0) {
                     return Ok(Ready((None, r)));
                 }
@@ -468,10 +482,6 @@ impl<R: AsyncRead> Future for ReadPacket<R> {
             }
 
             ReadPacketState::ReadBytes(length) => {
-                println!("entered ReadBytes, length: {}, old_len: {}, capacity: {}",
-                         length,
-                         packet.bytes.len(),
-                         packet.bytes.capacity());
                 let mut old_len = packet.bytes.len();
 
                 let capacity = packet.bytes.capacity();
@@ -479,7 +489,6 @@ impl<R: AsyncRead> Future for ReadPacket<R> {
                 let data_slice = unsafe { from_raw_parts_mut(data_ptr, capacity) };
 
                 while old_len < length as usize {
-                    println!("ReadBytesLoop {}", old_len);
                     match r.read(&mut data_slice[old_len..]) {
                         Ok(0) => {
                             return Err(Error::new(UnexpectedEof,
@@ -499,7 +508,6 @@ impl<R: AsyncRead> Future for ReadPacket<R> {
                     }
                 }
 
-                println!("done reading!");
                 return Ok(Ready((Some(packet), r)));
             }
         }
@@ -513,7 +521,7 @@ mod tests {
     use std::io::ErrorKind::InvalidData;
     use std::io::Write;
 
-    use partial_io::{PartialOp, PartialAsyncRead, PartialAsyncWrite, PartialWithErrors};
+    use partial_io::{PartialAsyncRead, PartialAsyncWrite, PartialWithErrors};
     use partial_io::quickcheck_types::GenInterruptedWouldBlock;
     use quickcheck::{QuickCheck, StdGen};
     use async_ringbuffer::*;
@@ -543,19 +551,19 @@ mod tests {
         let (writer, reader) = ring_buffer(buf_size + 1);
         let writer = PartialAsyncWrite::new(writer, write_ops);
         let reader = PartialAsyncRead::new(reader, read_ops);
-        let mut write_packet = WritePacket::new::<PacketStreamTrue,
-                                                  PacketEndFalse,
-                                                  PacketTypeBinary>(writer, data, id);
-        let mut read_packet = ReadPacket::new(reader);
+        let write_packet = WritePacket::new::<PacketStreamTrue,
+                                              PacketEndFalse,
+                                              PacketTypeBinary>(writer, data, id);
+        let read_packet = ReadPacket::new(reader);
 
         let (_, (p, _)) = write_packet.join(read_packet).wait().unwrap();
         let decoded_packet = p.unwrap();
 
-        assert_eq!(decoded_packet.flags,
-                   PacketStreamTrue::stream_flag() | PacketEndFalse::end_flag() |
-                   PacketTypeBinary::type_flag());;
-        assert_eq!(decoded_packet.id, id);
-        assert_eq!(decoded_packet.bytes, expected_data);
+        assert!(decoded_packet.is_stream_packet());
+        assert!(!decoded_packet.is_end_packet());
+        assert!(decoded_packet.is_buffer_packet());
+        assert_eq!(decoded_packet.id(), id);
+        assert_eq!(decoded_packet.into_data(), expected_data);
 
         return true;
     }
@@ -563,8 +571,8 @@ mod tests {
     #[test]
     fn test_error_on_invalid_packet_type() {
         let (mut writer, reader) = ring_buffer(8);
-        writer.write(&[3u8]); // header with invalid type flags
-        let mut read_packet = ReadPacket::new(reader);
+        assert_eq!(writer.write(&[3u8]).unwrap(), 1); // header with invalid type flags
+        let read_packet = ReadPacket::new(reader);
         let e = read_packet.wait().err().unwrap();
         assert_eq!(e.kind(), InvalidData);
     }
@@ -585,8 +593,8 @@ mod tests {
         let (writer, reader) = ring_buffer(64);
         let writer = PartialAsyncWrite::new(writer, write_ops);
         let reader = PartialAsyncRead::new(reader, read_ops);
-        let mut write_zeros = WriteZeros::new(writer);
-        let mut read_packet = ReadPacket::new(reader);
+        let write_zeros = WriteZeros::new(writer);
+        let read_packet = ReadPacket::new(reader);
 
         let (_, (p, _)) = write_zeros.join(read_packet).wait().unwrap();
         assert!(p.is_none());
