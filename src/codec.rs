@@ -1,0 +1,596 @@
+// Implements [packet-stream-codec](https://github.com/dominictarr/packet-stream-codec).
+
+use std::io::Error;
+use std::io::ErrorKind::{WouldBlock, Interrupted, WriteZero, UnexpectedEof, InvalidData};
+use std::u32::MAX;
+use std::mem::transmute;
+use std::slice::from_raw_parts_mut;
+
+use tokio_io::{AsyncWrite, AsyncRead};
+use futures::{Future, Poll};
+use futures::Async::{Ready, NotReady};
+
+pub type PacketId = i32;
+
+// Flags
+static STREAM: u8 = 0b0000_1000;
+static END: u8 = 0b0000_0100;
+static TYPE: u8 = 0b0000_0011;
+
+static TYPE_BINARY: u8 = 0;
+static TYPE_STRING: u8 = 1;
+static TYPE_JSON: u8 = 2;
+static TYPE_INVALID: u8 = 3;
+
+/// Type-Level indicator for whether a newly created packet should set its stream flag.
+pub trait PacketStream {
+    /// The bitflag signifying whether it's a stream packet.
+    fn stream_flag() -> u8;
+}
+
+/// Signifies a stream packet.
+pub enum PacketStreamTrue {}
+
+impl PacketStream for PacketStreamTrue {
+    fn stream_flag() -> u8 {
+        STREAM
+    }
+}
+
+/// Signifies a non-stream packet.
+pub enum PacketStreamFalse {}
+
+impl PacketStream for PacketStreamFalse {
+    fn stream_flag() -> u8 {
+        0
+    }
+}
+
+/// Type-Level indicator for whether a newly created packet should set its end flag.
+pub trait PacketEnd {
+    /// The bitflag signifying whether it's an end packet.
+    fn end_flag() -> u8;
+}
+
+/// Signifies an end packet.
+pub enum PacketEndTrue {}
+
+impl PacketEnd for PacketEndTrue {
+    fn end_flag() -> u8 {
+        END
+    }
+}
+
+/// Signifies a non-end packet.
+pub enum PacketEndFalse {}
+
+impl PacketEnd for PacketEndFalse {
+    fn end_flag() -> u8 {
+        0
+    }
+}
+
+/// Type-Level indicator for the type of a newly created packet.
+pub trait PacketType {
+    /// The bitflag signifying the packet's type.
+    fn type_flag() -> u8;
+}
+
+/// Signifies a binary packet.
+pub enum PacketTypeBinary {}
+
+impl PacketType for PacketTypeBinary {
+    fn type_flag() -> u8 {
+        TYPE_BINARY
+    }
+}
+
+/// Signifies a string packet.
+pub enum PacketTypeString {}
+
+impl PacketType for PacketTypeString {
+    fn type_flag() -> u8 {
+        TYPE_STRING
+    }
+}
+
+/// Signifies a json packet.
+pub enum PacketTypeJson {}
+
+impl PacketType for PacketTypeJson {
+    fn type_flag() -> u8 {
+        TYPE_JSON
+    }
+}
+
+/// A Future used to write an entire packet into an AsyncWrite.
+struct WritePacket<W, B> {
+    write: Option<W>,
+    packet: B,
+    state: WritePacketState,
+}
+
+impl<W, B: AsRef<[u8]>> WritePacket<W, B> {
+    /// Creates a new WritePacket future. Panics if the buffer is larger than
+    /// the maximum packet size `std::u32::MAX`.
+    ///
+    /// The flags are set via the type-level parameters T, S and E.
+    fn new<S: PacketStream, E: PacketEnd, T: PacketType>(write: W,
+                                                         packet: B,
+                                                         id: PacketId)
+                                                         -> WritePacket<W, B> {
+        if packet.as_ref().len() > MAX as usize {
+            panic!("Packet too large for packet-stream");
+        }
+
+        WritePacket {
+            write: Some(write),
+            packet,
+            state: WritePacketState::WriteFlags(T::type_flag() | S::stream_flag() | E::end_flag(),
+                                                id.to_be()),
+        }
+    }
+}
+
+// State for the WritePacket future.
+enum WritePacketState {
+    WriteFlags(u8, PacketId),
+    WriteLength(PacketId, u8), // u8 signifies how many bytes of the length have been written
+    WriteId(PacketId, u8), // u8 signifies how many bytes of the id have been written
+    WritePacket(u32), // u32 signifies how many bytes of the packet have been written
+}
+
+impl<W: AsyncWrite, B: AsRef<[u8]>> Future for WritePacket<W, B> {
+    type Item = W;
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let mut w = self.write
+            .take()
+            .expect("Polled WritePacket after completion");
+
+        match self.state {
+            WritePacketState::WriteFlags(flags, id) => {
+                loop {
+                    println!("WriteFlagsLoop, flags: {}", flags);
+                    match w.write(&[flags]) {
+                        Ok(0) => {
+                            return Err(Error::new(WriteZero, "failed to write packet flags"));
+                        }
+                        Ok(_) => {
+                            self.state = WritePacketState::WriteLength(id, 0);
+                            self.write = Some(w);
+                            return self.poll();
+                        }
+                        Err(ref e) if e.kind() == WouldBlock => {
+                            self.write = Some(w);
+                            return Ok(NotReady);
+                        }
+                        Err(ref e) if e.kind() == Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+
+            WritePacketState::WriteLength(id, initial_offset) => {
+                let len = (self.packet.as_ref().len() as u32).to_be();
+                println!("len: {}", len);
+                let len_bytes =
+                    unsafe { transmute::<_, [u8; 4]>((self.packet.as_ref().len() as u32).to_be()) };
+                let mut offset = initial_offset;
+                while offset < 4 {
+                    println!("WriteLengthLoop {}", offset);
+                    match w.write(&len_bytes[offset as usize..]) {
+                        Ok(0) => {
+                            return Err(Error::new(WriteZero, "failed to write packet length"));
+                        }
+                        Ok(written) => {
+                            println!("wrote length: {} {} {} {} from offset {}",
+                                     unsafe { transmute::<_, [u8; 4]>(len)[0] },
+                                     unsafe { transmute::<_, [u8; 4]>(len)[1] },
+                                     unsafe { transmute::<_, [u8; 4]>(len)[2] },
+                                     unsafe { transmute::<_, [u8; 4]>(len)[3] },
+                                     offset);
+                            offset += written as u8;
+                            self.state = WritePacketState::WriteLength(id, offset);
+                        }
+                        Err(ref e) if e.kind() == WouldBlock => {
+                            self.write = Some(w);
+                            return Ok(NotReady);
+                        }
+                        Err(ref e) if e.kind() == Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                self.state = WritePacketState::WriteId(id, 0);
+                self.write = Some(w);
+                return self.poll();
+            }
+
+            WritePacketState::WriteId(id, initial_offset) => {
+                let id_bytes = unsafe { transmute::<_, [u8; 4]>(id) };
+                let mut offset = initial_offset;
+                while offset < 4 {
+                    println!("WriteIdLoop, offset: {}, id_be: {}, id_native: {}, {} {} {} {}",
+                             offset,
+                             id,
+                             id.to_be(),
+                             id_bytes[0],
+                             id_bytes[1],
+                             id_bytes[2],
+                             id_bytes[3]);
+                    match w.write(&id_bytes[offset as usize..]) {
+                        Ok(0) => {
+                            return Err(Error::new(WriteZero, "failed to write packet id"));
+                        }
+                        Ok(written) => {
+                            offset += written as u8;
+                            self.state = WritePacketState::WriteId(id, offset);
+                        }
+                        Err(ref e) if e.kind() == WouldBlock => {
+                            self.write = Some(w);
+                            return Ok(NotReady);
+                        }
+                        Err(ref e) if e.kind() == Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                self.state = WritePacketState::WritePacket(0);
+                self.write = Some(w);
+                return self.poll();
+            }
+
+            WritePacketState::WritePacket(initial_offset) => {
+                let mut offset = initial_offset;
+                while (offset as usize) < self.packet.as_ref().len() {
+                    println!("WritePacketLoop {}", offset);
+                    match w.write(&self.packet.as_ref()[offset as usize..]) {
+                        Ok(0) => {
+                            return Err(Error::new(WriteZero, "failed to write packet data"));
+                        }
+                        Ok(written) => {
+                            offset += written as u32;
+                            self.state = WritePacketState::WritePacket(offset);
+                        }
+                        Err(ref e) if e.kind() == WouldBlock => {
+                            self.write = Some(w);
+                            return Ok(NotReady);
+                        }
+                        Err(ref e) if e.kind() == Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                return Ok(Ready(w));
+            }
+        }
+    }
+}
+
+// Future to write an end of packet-stream header. The state is how many zero
+// bytes have already been written.
+struct WriteZeros<W>(u8, Option<W>);
+
+impl<W> WriteZeros<W> {
+    fn new(w: W) -> WriteZeros<W> {
+        WriteZeros(0, Some(w))
+    }
+}
+
+impl<W: AsyncWrite> Future for WriteZeros<W> {
+    type Item = W;
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let zeros = [0u8, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut offset = self.0;
+        let mut w = self.1
+            .take()
+            .expect("Polled WriteZeros after completion");
+
+        while offset < 9 {
+            match w.write(&zeros[offset as usize..]) {
+                Ok(0) => {
+                    return Err(Error::new(WriteZero, "failed to write end-of-stream header"));
+                }
+                Ok(written) => {
+                    offset += written as u8;
+                    self.0 = offset;
+                }
+                Err(ref e) if e.kind() == WouldBlock => {
+                    self.1 = Some(w);
+                    return Ok(NotReady);
+                }
+                Err(ref e) if e.kind() == Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        return Ok(Ready(w));
+    }
+}
+
+struct DecodedPacket {
+    flags: u8,
+    id: PacketId,
+    bytes: Vec<u8>,
+}
+
+impl DecodedPacket {
+    // TODO methods returning booleans for checking flags
+    // TODO other getters
+}
+
+// A Future used to read a packet from an AsyncRead
+struct ReadPacket<R> {
+    read: Option<R>,
+    packet: Option<DecodedPacket>,
+    state: ReadPacketState,
+}
+
+impl<R> ReadPacket<R> {
+    fn new(read: R) -> ReadPacket<R> {
+        ReadPacket {
+            read: Some(read),
+            packet: Some(DecodedPacket {
+                             flags: 0,
+                             id: 0,
+                             bytes: Vec::new(),
+                         }),
+            state: ReadPacketState::ReadFlags,
+        }
+    }
+}
+
+enum ReadPacketState {
+    ReadFlags,
+    ReadLength(u8, [u8; 4]),
+    ReadId(u8, u32, [u8; 4]),
+    ReadBytes(u32),
+}
+
+impl<R: AsyncRead> Future for ReadPacket<R> {
+    type Item = (Option<DecodedPacket>, R); // `None` if encountered a zeros header
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let mut r = self.read
+            .take()
+            .expect("Polled ReadPacket after completion");
+        let mut packet = self.packet.take().unwrap();
+
+        match self.state {
+            ReadPacketState::ReadFlags => {
+                let mut read_buf = [0u8; 1];
+                loop {
+                    println!("ReadFlagsLoop");
+                    match r.read(&mut read_buf) {
+                        Ok(0) => {
+                            return Err(Error::new(UnexpectedEof, "failed to read packet flags"));
+                        }
+                        Ok(_) => {
+                            packet.flags = read_buf[0];
+                            if (packet.flags & TYPE) == TYPE_INVALID {
+                                return Err(Error::new(InvalidData,
+                                                      "read packet with invalid type flag"));
+                            }
+
+                            self.state = ReadPacketState::ReadLength(0, [0; 4]);
+                            println!("read flags: {}", packet.flags);
+                            self.read = Some(r);
+                            self.packet = Some(packet);
+                            return self.poll();
+                        }
+                        Err(ref e) if e.kind() == WouldBlock => {
+                            self.read = Some(r);
+                            self.packet = Some(packet);
+                            return Ok(NotReady);
+                        }
+                        Err(ref e) if e.kind() == Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+
+            ReadPacketState::ReadLength(initial_offset, mut length_buf) => {
+                let mut offset = initial_offset;
+                while offset < 4 {
+                    println!("ReadLengthLoop {}", offset);
+                    match r.read(&mut length_buf[offset as usize..]) {
+                        Ok(0) => {
+                            return Err(Error::new(UnexpectedEof, "failed to read packet length"));
+                        }
+                        Ok(read) => {
+                            offset += read as u8;
+                            self.state = ReadPacketState::ReadLength(offset, length_buf);
+                        }
+                        Err(ref e) if e.kind() == WouldBlock => {
+                            self.read = Some(r);
+                            self.packet = Some(packet);
+                            return Ok(NotReady);
+                        }
+                        Err(ref e) if e.kind() == Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                let length = u32::from_be(unsafe { transmute::<[u8; 4], u32>(length_buf) });
+                self.state = ReadPacketState::ReadId(0, length, [0u8; 4]);
+                self.read = Some(r);
+                self.packet = Some(packet);
+                return self.poll();
+            }
+
+            ReadPacketState::ReadId(initial_offset, length, mut id_buf) => {
+                let mut offset = initial_offset;
+                while offset < 4 {
+                    println!("ReadIdLoop {}", offset);
+                    match r.read(&mut id_buf[offset as usize..]) {
+                        Ok(0) => {
+                            return Err(Error::new(UnexpectedEof, "failed to read packet id"));
+                        }
+                        Ok(read) => {
+                            offset += read as u8;
+                            self.state = ReadPacketState::ReadId(offset, length, id_buf);
+                        }
+                        Err(ref e) if e.kind() == WouldBlock => {
+                            self.read = Some(r);
+                            self.packet = Some(packet);
+                            return Ok(NotReady);
+                        }
+                        Err(ref e) if e.kind() == Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                println!("left ReadId loop");
+
+                packet.id = i32::from_be(unsafe { transmute::<[u8; 4], i32>(id_buf) });
+
+                println!("length: {}, id: {}, flags: {}",
+                         length,
+                         packet.id,
+                         packet.flags);
+                println!("\n\n");
+
+                // TODO check for zero lenth as error if not a final header
+                if (length == 0) && (packet.id == 0) && (packet.flags == 0) {
+                    return Ok(Ready((None, r)));
+                }
+
+                self.state = ReadPacketState::ReadBytes(length);
+                packet.bytes.reserve_exact(length as usize);
+                self.read = Some(r);
+                self.packet = Some(packet);
+                return self.poll();
+            }
+
+            ReadPacketState::ReadBytes(length) => {
+                println!("entered ReadBytes, length: {}, old_len: {}, capacity: {}",
+                         length,
+                         packet.bytes.len(),
+                         packet.bytes.capacity());
+                let mut old_len = packet.bytes.len();
+
+                let capacity = packet.bytes.capacity();
+                let data_ptr = packet.bytes.as_mut_slice().as_mut_ptr();
+                let data_slice = unsafe { from_raw_parts_mut(data_ptr, capacity) };
+
+                while old_len < length as usize {
+                    println!("ReadBytesLoop {}", old_len);
+                    match r.read(&mut data_slice[old_len..]) {
+                        Ok(0) => {
+                            return Err(Error::new(UnexpectedEof,
+                                                  "failed to read whole packet content"));
+                        }
+                        Ok(read) => {
+                            unsafe { packet.bytes.set_len(old_len + read) };
+                            old_len += read;
+                        }
+                        Err(ref e) if e.kind() == WouldBlock => {
+                            self.read = Some(r);
+                            self.packet = Some(packet);
+                            return Ok(NotReady);
+                        }
+                        Err(ref e) if e.kind() == Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                println!("done reading!");
+                return Ok(Ready((Some(packet), r)));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::ErrorKind::InvalidData;
+    use std::io::Write;
+
+    use partial_io::{PartialOp, PartialAsyncRead, PartialAsyncWrite, PartialWithErrors};
+    use partial_io::quickcheck_types::GenInterruptedWouldBlock;
+    use quickcheck::{QuickCheck, StdGen};
+    use async_ringbuffer::*;
+    use rand;
+
+    #[test]
+    fn codec() {
+        let rng = StdGen::new(rand::thread_rng(), 2000);
+        let mut quickcheck = QuickCheck::new().gen(rng).tests(1000);
+        quickcheck.quickcheck(test_codec as
+                              fn(usize,
+                                 i32,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 Vec<u8>)
+                                 -> bool);
+    }
+
+    fn test_codec(buf_size: usize,
+                  id: i32,
+                  write_ops: PartialWithErrors<GenInterruptedWouldBlock>,
+                  read_ops: PartialWithErrors<GenInterruptedWouldBlock>,
+                  data: Vec<u8>)
+                  -> bool {
+        let expected_data = data.clone();
+
+        let (writer, reader) = ring_buffer(buf_size + 1);
+        let writer = PartialAsyncWrite::new(writer, write_ops);
+        let reader = PartialAsyncRead::new(reader, read_ops);
+        let mut write_packet = WritePacket::new::<PacketStreamTrue,
+                                                  PacketEndFalse,
+                                                  PacketTypeBinary>(writer, data, id);
+        let mut read_packet = ReadPacket::new(reader);
+
+        let (_, (p, _)) = write_packet.join(read_packet).wait().unwrap();
+        let decoded_packet = p.unwrap();
+
+        assert_eq!(decoded_packet.flags,
+                   PacketStreamTrue::stream_flag() | PacketEndFalse::end_flag() |
+                   PacketTypeBinary::type_flag());;
+        assert_eq!(decoded_packet.id, id);
+        assert_eq!(decoded_packet.bytes, expected_data);
+
+        return true;
+    }
+
+    #[test]
+    fn test_error_on_invalid_packet_type() {
+        let (mut writer, reader) = ring_buffer(8);
+        writer.write(&[3u8]); // header with invalid type flags
+        let mut read_packet = ReadPacket::new(reader);
+        let e = read_packet.wait().err().unwrap();
+        assert_eq!(e.kind(), InvalidData);
+    }
+
+    #[test]
+    fn zero_header() {
+        let rng = StdGen::new(rand::thread_rng(), 20);
+        let mut quickcheck = QuickCheck::new().gen(rng).tests(1000);
+        quickcheck.quickcheck(test_zero_header as
+                              fn(PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>)
+                                 -> bool);
+    }
+
+    fn test_zero_header(write_ops: PartialWithErrors<GenInterruptedWouldBlock>,
+                        read_ops: PartialWithErrors<GenInterruptedWouldBlock>)
+                        -> bool {
+        let (writer, reader) = ring_buffer(64);
+        let writer = PartialAsyncWrite::new(writer, write_ops);
+        let reader = PartialAsyncRead::new(reader, read_ops);
+        let mut write_zeros = WriteZeros::new(writer);
+        let mut read_packet = ReadPacket::new(reader);
+
+        let (_, (p, _)) = write_zeros.join(read_packet).wait().unwrap();
+        assert!(p.is_none());
+
+        return true;
+    }
+}

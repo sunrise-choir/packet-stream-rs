@@ -1,0 +1,16 @@
+[package]
+name = "packet-stream"
+version = "0.1.0"
+authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
+
+[dependencies]
+futures = "0.1.17"
+tokio-io = "0.1.4"
+atm-io-utils = "0.1.0"
+# async-byteorder = { git = "https://github.com/AljoschaMeyer/async-byteorder" } TODO remove this
+
+[dev-dependencies]
+partial-io = { version = "0.2.5", features = ["quickcheck", "tokio"] }
+quickcheck = "0.4.1"
+async-ringbuffer = "0.1.0"
+rand = "0.3.18"
