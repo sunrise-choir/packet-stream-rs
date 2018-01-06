@@ -7,7 +7,7 @@ use std::mem::transmute;
 use std::slice::from_raw_parts_mut;
 
 use tokio_io::{AsyncWrite, AsyncRead};
-use futures::{Future, Poll};
+use futures::{Future, Poll, Stream, Sink, StartSend, AsyncSink, Async};
 use futures::Async::{Ready, NotReady};
 
 pub type PacketId = i32;
@@ -129,6 +129,11 @@ impl<W, B: AsRef<[u8]>> WritePacket<W, B> {
             state: WritePacketState::WriteFlags(T::type_flag() | S::stream_flag() | E::end_flag(),
                                                 id.to_be()),
         }
+    }
+
+    pub fn into_inner(self) -> W {
+        self.write
+            .expect("Called into_inner on WritePacket future after completion")
     }
 }
 
@@ -514,6 +519,270 @@ impl<R: AsyncRead> Future for ReadPacket<R> {
     }
 }
 
+/// An enumeration representing the different types a packet can have.
+pub enum PsPacketType {
+    /// Raw binary data.
+    Binary,
+    /// A utf-8 encoded string.
+    String,
+    /// A valid piece of json.
+    Json,
+}
+
+pub struct PacketInfo {
+    ptype: PsPacketType,
+    is_stream: bool,
+    is_end: bool,
+    id: PacketId,
+}
+
+impl PacketInfo {
+    // Create a WritePacket future according to the info.
+    fn write_packet<W, B: AsRef<[u8]>>(&self, w: W, bytes: B) -> WritePacket<W, B> {
+        match self.ptype {
+            PsPacketType::Binary => {
+                if self.is_stream {
+                    if self.is_end {
+                        WritePacket::new::<PacketStreamTrue,
+                                           PacketEndTrue,
+                                           PacketTypeBinary>(w, bytes, self.id)
+                    } else {
+                        WritePacket::new::<PacketStreamTrue,
+                                           PacketEndFalse,
+                                           PacketTypeBinary>(w, bytes, self.id)
+                    }
+                } else {
+                    if self.is_end {
+                        WritePacket::new::<PacketStreamFalse,
+                                           PacketEndTrue,
+                                           PacketTypeBinary>(w, bytes, self.id)
+                    } else {
+                        WritePacket::new::<PacketStreamFalse,
+                                           PacketEndFalse,
+                                           PacketTypeBinary>(w, bytes, self.id)
+                    }
+                }
+            }
+            PsPacketType::String => {
+                if self.is_stream {
+                    if self.is_end {
+                        WritePacket::new::<PacketStreamTrue,
+                                           PacketEndTrue,
+                                           PacketTypeString>(w, bytes, self.id)
+                    } else {
+                        WritePacket::new::<PacketStreamTrue,
+                                           PacketEndFalse,
+                                           PacketTypeString>(w, bytes, self.id)
+                    }
+                } else {
+                    if self.is_end {
+                        WritePacket::new::<PacketStreamFalse,
+                                           PacketEndTrue,
+                                           PacketTypeString>(w, bytes, self.id)
+                    } else {
+                        WritePacket::new::<PacketStreamFalse,
+                                           PacketEndFalse,
+                                           PacketTypeString>(w, bytes, self.id)
+                    }
+                }
+            }
+            PsPacketType::Json => {
+                if self.is_stream {
+                    if self.is_end {
+                        WritePacket::new::<PacketStreamTrue,
+                                           PacketEndTrue,
+                                           PacketTypeJson>(w, bytes, self.id)
+                    } else {
+                        WritePacket::new::<PacketStreamTrue,
+                                           PacketEndFalse,
+                                           PacketTypeJson>(w, bytes, self.id)
+                    }
+                } else {
+                    if self.is_end {
+                        WritePacket::new::<PacketStreamFalse,
+                                           PacketEndTrue,
+                                           PacketTypeJson>(w, bytes, self.id)
+                    } else {
+                        WritePacket::new::<PacketStreamFalse,
+                                           PacketEndFalse,
+                                           PacketTypeJson>(w, bytes, self.id)
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum SinkState<W, B> {
+    Waiting(W),
+    Writing(WritePacket<W, B>),
+}
+
+// From AsyncWrite to Sink<(B, PsPacketType)>
+pub struct PSCodecSink<W, B> {
+    write: Option<W>,
+    future: Option<WritePacket<W, B>>,
+}
+
+impl<W, B: AsRef<[u8]>> PSCodecSink<W, B> {
+    pub fn new(write: W) -> PSCodecSink<W, B> {
+        PSCodecSink {
+            write: Some(write),
+            future: None,
+        }
+    }
+
+    pub fn into_inner(self) -> W {
+        match self.write {
+            Some(w) => w,
+            None => self.future.unwrap().into_inner(),
+        }
+    }
+}
+
+impl<W: AsyncWrite, B: AsRef<[u8]>> Sink for PSCodecSink<W, B> {
+    type SinkItem = (B, PacketInfo);
+    type SinkError = Error;
+
+    fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
+        match self.write.take() {
+            Some(w) => {
+                self.future = Some(item.1.write_packet(w, item.0));
+                return Ok(AsyncSink::Ready);
+            }
+            None => {
+                let mut future = self.future
+                    .take()
+                    .expect("Started sending on PsSink after closing");
+                match future.poll() {
+                    Ok(Async::Ready(w)) => {
+                        self.write = Some(w);
+                        return self.start_send(item);
+                    }
+                    Ok(Async::NotReady) => {
+                        self.future = Some(future);
+                        return Ok(AsyncSink::NotReady(item));
+                    }
+                    Err(e) => {
+                        self.future = Some(future);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
+        match self.write.take() {
+            Some(mut w) => {
+                loop {
+                    match w.flush() {
+                        Ok(_) => {
+                            self.write = Some(w);
+                            return Ok(Async::Ready(()));
+                        }
+                        Err(ref e) if e.kind() == WouldBlock => {
+                            self.write = Some(w);
+                            return Ok(NotReady);
+                        }
+                        Err(ref e) if e.kind() == Interrupted => {}
+                        Err(e) => {
+                            self.write = Some(w);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            None => {
+                let mut future = self.future
+                    .take()
+                    .expect("Started flushing PsSink after closing");
+                match future.poll() {
+                    Ok(Async::Ready(w)) => {
+                        self.write = Some(w);
+                        return self.poll_complete();
+                    }
+                    Ok(Async::NotReady) => {
+                        self.future = Some(future);
+                        return Ok(Async::NotReady);
+                    }
+                    Err(e) => {
+                        self.future = Some(future);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    fn close(&mut self) -> Poll<(), Self::SinkError> {
+        match self.write.take() {
+            Some(mut w) => {
+                match w.shutdown() {
+                    Ok(Async::Ready(_)) => {
+                        self.write = Some(w);
+                        return Ok(Async::Ready(()));
+                    }
+                    Ok(Async::NotReady) => {
+                        self.write = Some(w);
+                        return Ok(Async::NotReady);
+                    }
+                    Err(e) => {
+                        self.write = Some(w);
+                        return Err(e);
+                    }
+                }
+            }
+            None => {
+                let mut future = self.future
+                    .take()
+                    .expect("Started closing PsSink after closing");
+                match future.poll() {
+                    Ok(Async::Ready(w)) => {
+                        self.write = Some(w);
+                        return self.close();
+                    }
+                    Ok(Async::NotReady) => {
+                        self.future = Some(future);
+                        return Ok(Async::NotReady);
+                    }
+                    Err(e) => {
+                        self.future = Some(future);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        // finish sending first, then
+        // write zeros, then
+        // close write
+        unimplemented!()
+    }
+}
+
+enum StreamState<R> {
+    Waiting(R),
+    Writing(ReadPacket<R>),
+}
+
+// From AsyncRead to Stream<DecodedPacket>
+pub struct PSCodecStream<R>(StreamState<R>);
+
+impl<R> PSCodecStream<R> {
+    pub fn new(read: R) -> PSCodecStream<R> {
+        PSCodecStream(StreamState::Waiting(read))
+    }
+}
+
+impl<R: AsyncRead> Stream for PSCodecStream<R> {
+    type Item = DecodedPacket;
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        unimplemented!()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,6 +867,53 @@ mod tests {
 
         let (_, (p, _)) = write_zeros.join(read_packet).wait().unwrap();
         assert!(p.is_none());
+
+        return true;
+    }
+
+    #[test]
+    fn codec_sink_stream() {
+        let rng = StdGen::new(rand::thread_rng(), 2000);
+        let mut quickcheck = QuickCheck::new().gen(rng).tests(200);
+        quickcheck.quickcheck(test_codec_sink_stream as
+                              fn(usize,
+                                 i32,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 Vec<u8>)
+                                 -> bool);
+    }
+
+    fn test_codec_sink_stream(buf_size: usize,
+                              id: i32,
+                              write_ops: PartialWithErrors<GenInterruptedWouldBlock>,
+                              read_ops: PartialWithErrors<GenInterruptedWouldBlock>,
+                              data: Vec<u8>)
+                              -> bool {
+        let expected_data = data.clone();
+
+        // TODO use read_ops and write_ops
+
+        let (writer, reader) = ring_buffer(buf_size + 1);
+        let writer = PartialAsyncWrite::new(writer, write_ops);
+        let reader = PartialAsyncRead::new(reader, read_ops);
+
+        let sink = PSCodecSink::new(writer);
+        let stream = PSCodecStream::new(reader);
+
+        let write_packet = WritePacket::new::<PacketStreamTrue,
+                                              PacketEndFalse,
+                                              PacketTypeBinary>(writer, data, id);
+        let read_packet = ReadPacket::new(reader);
+
+        let (_, (p, _)) = write_packet.join(read_packet).wait().unwrap();
+        let decoded_packet = p.unwrap();
+
+        assert!(decoded_packet.is_stream_packet());
+        assert!(!decoded_packet.is_end_packet());
+        assert!(decoded_packet.is_buffer_packet());
+        assert_eq!(decoded_packet.id(), id);
+        assert_eq!(decoded_packet.into_data(), expected_data);
 
         return true;
     }
