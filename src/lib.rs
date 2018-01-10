@@ -19,4 +19,5 @@ extern crate rand;
 
 mod raw;
 mod codec;
+mod codec2; // TODO make thiss the codec implementation
 pub mod ps;
