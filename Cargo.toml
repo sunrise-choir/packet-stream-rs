@@ -11,11 +11,10 @@ license = "GPL-3.0"
 futures = "0.1.17"
 tokio-io = "0.1.4"
 atm-io-utils = "0.1.0"
+atm-async-utils = "0.1.1"
 void = "1.0.2"
-bytes = "0.4.5"
 multi-producer-sink = "0.1.0"
-multi-consumer-stream = "0.1.0"
-# async-byteorder = { git = "https://github.com/AljoschaMeyer/async-byteorder" } TODO remove this
+multi-consumer-stream = "0.2.0"
 
 [dev-dependencies]
 partial-io = { version = "0.2.5", features = ["quickcheck", "tokio"] }

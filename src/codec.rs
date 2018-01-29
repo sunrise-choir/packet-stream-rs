@@ -15,8 +15,8 @@ use ps::PsPacketType;
 pub type PacketId = i32;
 
 pub struct MetaData {
-    flags: u8,
-    id: PacketId,
+    pub flags: u8,
+    pub id: PacketId,
 }
 
 // Flags
@@ -24,13 +24,13 @@ static STREAM: u8 = 0b0000_1000;
 static END: u8 = 0b0000_0100;
 static TYPE: u8 = 0b0000_0011;
 
-static TYPE_BINARY: u8 = 0;
-static TYPE_STRING: u8 = 1;
-static TYPE_JSON: u8 = 2;
+pub static TYPE_BINARY: u8 = 0;
+pub static TYPE_STRING: u8 = 1;
+pub static TYPE_JSON: u8 = 2;
 static TYPE_INVALID: u8 = 3;
 
 /// A Future used to write an entire packet into an AsyncWrite.
-pub struct WritePacket<W, B> {
+struct WritePacket<W, B> {
     write: Option<W>,
     packet: B,
     state: WritePacketState,
@@ -181,7 +181,7 @@ impl<W: AsyncWrite, B: AsRef<[u8]>> Future for WritePacket<W, B> {
 }
 
 /// Future to write an end of packet-stream header.
-pub struct WriteZeros<W>(u8, Option<W>);
+struct WriteZeros<W>(u8, Option<W>);
 //The state is how many zero bytes have already been written.
 
 impl<W> WriteZeros<W> {
@@ -466,7 +466,7 @@ impl DecodedPacket {
 }
 
 /// A Future used to read a packet from an AsyncRead
-pub struct ReadPacket<R> {
+struct ReadPacket<R> {
     read: Option<R>,
     packet: Option<DecodedPacket>,
     state: ReadPacketState,
@@ -633,13 +633,11 @@ impl<R: AsyncRead> Future for ReadPacket<R> {
 
 // From AsyncRead to Stream<DecodedPacket>
 pub struct PSCodecStream<R> {
-    // state: Option<StreamState<R>>,
     state: Option<ReadPacket<R>>,
 }
 
 impl<R> PSCodecStream<R> {
     pub fn new(read: R) -> PSCodecStream<R> {
-        // PSCodecStream { state: Some(StreamState::Waiting(read)) }
         PSCodecStream { state: Some(ReadPacket::new(read)) }
     }
 }
