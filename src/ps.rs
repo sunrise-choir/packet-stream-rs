@@ -154,6 +154,19 @@ impl<'owner, W: AsyncWrite, B: AsRef<[u8]>> SendRequest<'owner, W, B> {
     }
 }
 
+impl<'owner, W: AsyncWrite, B: AsRef<[u8]>> Future for SendRequest<'owner, W, B> {
+    type Item = ();
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        match self.0.poll() {
+            Ok(Async::Ready(_)) => Ok(Async::Ready(())),
+            Ok(Async::NotReady) => Ok(Async::NotReady),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 /// A response that will be received from the peer.
 pub struct InResponse<'owner, R: 'owner + AsyncRead>(KeyHandle<'owner,
                                                                 PSCodecStream<R>,
@@ -372,3 +385,71 @@ impl<B> Sink for PsDuplex<B> {
 }
 
 // TODO PsOut: Implements clone so that multiple of the methods which need mutable references can be used without problems.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::ErrorKind::InvalidData;
+    use std::io::Write;
+
+    use partial_io::{PartialAsyncRead, PartialAsyncWrite, PartialWithErrors};
+    use partial_io::quickcheck_types::GenInterruptedWouldBlock;
+    use quickcheck::{QuickCheck, StdGen};
+    use async_ringbuffer::*;
+    use rand;
+    use futures::stream::iter_ok;
+    use futures::future::join_all;
+
+    #[test]
+    fn requests() {
+        let rng = StdGen::new(rand::thread_rng(), 100);
+        let mut quickcheck = QuickCheck::new().gen(rng).tests(100);
+        quickcheck.quickcheck(test_requests as
+                              fn(usize,
+                                 usize,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>)
+                                 -> bool);
+    }
+
+    fn test_requests(buf_size_a: usize,
+                     buf_size_b: usize,
+                     write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
+                     read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
+                     write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
+                     read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
+                     -> bool {
+        let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
+        let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
+        let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
+        let ps_a = PsOwner::new(reader_a, writer_a);
+        let incoming_a = ps_a.incoming();
+
+        let (writer_b, reader_b) = ring_buffer(buf_size_b + 1);
+        let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
+        let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
+        let ps_b = PsOwner::new(reader_b, writer_b);
+        let incoming_b = ps_b.incoming();
+
+        let echo = ps_b.incoming()
+            .for_each(|incoming_packet| match incoming_packet {
+                          IncomingPacket::Request(in_request) => {
+                let data = in_request.packet().data().clone();
+                in_request.respond(data, PsPacketType::Binary)
+            }
+                          IncomingPacket::Duplex(_) => unreachable!(),
+                      });
+
+        let requests = (0u8..64).map(|i| ps_a.request([i], PsPacketType::Binary));
+        let send_requests = join_all(requests.map(|(r, _)| r));
+        // TODO ps_a: write requests and check that responses equal the sent value
+        // TODO ps_a: consume instream
+
+        // TODO run both echo and the sending/receive-and-check future
+
+        return false;
+    }
+}
