@@ -1,5 +1,3 @@
-#![feature(closure_to_fn_coercion)]
-
 #![warn(missing_docs)]
 
 #[macro_use(try_ready)]

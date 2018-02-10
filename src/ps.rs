@@ -35,6 +35,8 @@ impl PsPacketType {
     }
 }
 
+// TODO error UnexpectedEOF on all stuff waiting for input when receiving end-of-stream
+
 /// Wrapper around an AsyncRead and an AsyncWrite to allow running a
 /// packet-stream over them.
 ///
@@ -86,6 +88,9 @@ impl<R: AsyncRead, W: AsyncWrite, B: AsRef<[u8]>> PsOwner<R, W, B> {
 
     // TODO create duplexes
 
+    pub fn close(&mut self) -> Poll<(), io::Error> {
+        self.sink.close()
+    }
 
     fn next_id(&self) -> PacketId {
         let mut state = self.state.borrow_mut();
@@ -399,11 +404,11 @@ mod tests {
     use async_ringbuffer::*;
     use rand;
     use futures::stream::iter_ok;
-    use futures::future::join_all;
+    use futures::future::{join_all, ok};
 
     #[test]
     fn requests() {
-        let rng = StdGen::new(rand::thread_rng(), 100);
+        let rng = StdGen::new(rand::thread_rng(), 4);
         let mut quickcheck = QuickCheck::new().gen(rng).tests(100);
         quickcheck.quickcheck(test_requests as
                               fn(usize,
@@ -443,13 +448,25 @@ mod tests {
                           IncomingPacket::Duplex(_) => unreachable!(),
                       });
 
-        let requests = (0u8..64).map(|i| ps_a.request([i], PsPacketType::Binary));
-        let send_requests = join_all(requests.map(|(r, _)| r));
-        // TODO ps_a: write requests and check that responses equal the sent value
-        // TODO ps_a: consume instream
+        let consume_a = ps_a.incoming().for_each(|_| ok(()));
 
-        // TODO run both echo and the sending/receive-and-check future
+        let (req0, res0) = ps_a.request([0], PsPacketType::Binary);
+        let (req1, res1) = ps_a.request([1], PsPacketType::Binary);
+        let (req2, res2) = ps_a.request([2], PsPacketType::Binary);
 
-        return false;
+        let send_all = req0.join3(req1, req2);
+        let receive_all = res0.join3(res1, res2)
+            .map(|(r0, r1, r2)| {
+                     return r0.data() == &vec![0u8] && r0.is_buffer_packet() &&
+                            r1.data() == &vec![1u8] &&
+                            r1.is_buffer_packet() &&
+                            r2.data() == &vec![2u8] &&
+                            r2.is_buffer_packet();
+                 });
+
+        return echo.join4(consume_a, send_all, receive_all)
+                   .map(|(_, _, _, worked)| worked)
+                   .wait()
+                   .unwrap();
     }
 }
