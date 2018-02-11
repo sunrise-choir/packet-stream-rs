@@ -1,6 +1,7 @@
 use std::marker::PhantomData;
 use std::io;
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::i32::MAX;
 
 use futures::{Stream, Poll, Future, Sink, AsyncSink, StartSend, Async, AndThen};
@@ -9,8 +10,8 @@ use futures::stream::StreamFuture;
 use futures::future::{Map, MapErr};
 use tokio_io::{AsyncRead, AsyncWrite};
 use void::Void;
-use multi_producer_sink::{OwnerMPS, Handle};
-use multi_consumer_stream::{OwnerMCS, DefaultHandle, KeyHandle};
+use multi_producer_sink::MPS;
+use multi_consumer_stream::{DefaultMCS, KeyMCS};
 use atm_async_utils::sink_futures::Close;
 
 use codec::*;
@@ -35,85 +36,52 @@ impl PsPacketType {
     }
 }
 
-// TODO error UnexpectedEOF on all stuff waiting for input when receiving end-of-stream
-
-/// Wrapper around an AsyncRead and an AsyncWrite to allow running a
-/// packet-stream over them.
+/// Take ownership of an AsyncRead and an AsyncWrite to create the two halves of
+/// a packet-stream.
 ///
 /// `R` is the `AsyncRead` for reading bytes from the peer, `W` is the
 /// `AsyncWrite` for writing bytes to the peer, and `B` is the type that is used
 /// as input for sending data.
-pub struct PsOwner<R, W, B: AsRef<[u8]>>
-    where R: AsyncRead,
-          W: AsyncWrite
+///
+/// Note that the AsyncRead may be polled for data even after it has signalled
+/// end of data. Only use AsyncReads that can correctly handle this.
+pub fn packet_stream<R: AsyncRead, W, B: AsRef<[u8]>>(r: R,
+                                                      w: W)
+                                                      -> (PsIn<R, W, B>, PsOut<R, W, B>) {
+    let ps = Rc::new(RefCell::new(PS::new(r, w)));
+
+    (PsIn(Rc::clone(&ps)), PsOut(ps))
+}
+
+/// Shared state between a PsIn, PsOut and requests, duplexes, etc.
+struct PS<R, W, B>
+    where R: AsyncRead
 {
-    sink: OwnerMPS<PSCodecSink<W, B>>,
-    stream: OwnerMCS<PSCodecStream<R>, PacketId, fn(&DecodedPacket) -> PacketId>,
-    state: RefCell<Shared>,
-}
-
-impl<R: AsyncRead, W: AsyncWrite, B: AsRef<[u8]>> PsOwner<R, W, B> {
-    /// Take ownership of an AsyncRead and an AsyncWrite to create a `PsOwner`.
-    pub fn new(r: R, w: W) -> PsOwner<R, W, B> {
-        PsOwner {
-            sink: OwnerMPS::new(PSCodecSink::new(w)),
-            stream: OwnerMCS::new(PSCodecStream::new(r), DecodedPacket::id),
-            state: RefCell::new(Shared::new()),
-        }
-    }
-
-    /// Obtain a `PsIncoming`, used to receive packets from the peer.
-    ///
-    /// When using packet-stream, you must always create exactly one `PsIncoming`,
-    /// and it must be consumed. Otherwise, the whole incoming traffic is blocked
-    /// once the peer send a packet that is neither a response nor part of a
-    /// duplex stream.
-    ///
-    /// Yes, the *exactly one* requirement is ugly, but the upside of this API
-    /// is that we can use lifetimes to make sure that nothing that uses the
-    /// packet-stream (i.e. substreams and requests) outlives it.
-    pub fn incoming(&self) -> PsIncoming<R, W, B> {
-        PsIncoming::new(self)
-    }
-
-    /// Send a request to the peer.
-    ///
-    /// The first returned Future must be polled to actually start sending the
-    /// request. The second Future can be polled to receive the response.
-    pub fn request(&self, data: B, t: PsPacketType) -> (SendRequest<W, B>, InResponse<R>) {
-        let id = self.next_id();
-        (SendRequest::new(self.sink.handle(), data, t, id),
-         InResponse::new(self.stream.key_handle(id * -1)))
-    }
-
-    // TODO create duplexes
-
-    pub fn close(&mut self) -> Poll<(), io::Error> {
-        self.sink.close()
-    }
-
-    fn next_id(&self) -> PacketId {
-        let mut state = self.state.borrow_mut();
-        let ret = state.id_counter;
-        state.increment_id();
-        return ret;
-    }
-}
-
-// State for the PsOwner.
-struct Shared {
+    sink: MPS<PSCodecSink<W, B>>,
+    stream: DefaultMCS<PSCodecStream<R>, PacketId, fn(&DecodedPacket) -> PacketId>,
     // The id used for the next actively sent packet.
     id_counter: PacketId,
     // The next id to be accepted as an active packet from the peer.
     accepted_id: PacketId,
 }
 
-impl Shared {
-    fn new() -> Shared {
-        Shared {
+impl<R, W, B> PS<R, W, B>
+    where R: AsyncRead,
+          B: AsRef<[u8]>
+{
+    fn new(r: R, w: W) -> PS<R, W, B> {
+        PS {
+            sink: MPS::new(PSCodecSink::new(w)),
+            stream: DefaultMCS::new(PSCodecStream::new(r), DecodedPacket::id),
             id_counter: 1,
             accepted_id: 1,
         }
+    }
+
+    fn next_id(&mut self) -> PacketId {
+        let ret = self.id_counter;
+        self.increment_id();
+        return ret;
     }
 
     fn increment_id(&mut self) {
@@ -131,118 +99,19 @@ impl Shared {
             self.accepted_id += 1
         }
     }
-}
 
-/// A request initated by this packet-stream.
-///
-/// Poll it to actually start sending the request.
-pub struct SendRequest<'owner, W: 'owner + AsyncWrite, B: 'owner + AsRef<[u8]>>(
-        AndThen<
-            Send<Handle<'owner, PSCodecSink<W, B>>>,
-            Close<Handle<'owner, PSCodecSink<W, B>>>,
-            fn(Handle<'owner, PSCodecSink<W, B>>) -> Close<Handle<'owner, PSCodecSink<W, B>>>
-        >);
-
-impl<'owner, W: AsyncWrite, B: AsRef<[u8]>> SendRequest<'owner, W, B> {
-    fn new(sink_handle: Handle<'owner, PSCodecSink<W, B>>,
-           data: B,
-           t: PsPacketType,
-           id: PacketId)
-           -> SendRequest<'owner, W, B> {
-        SendRequest(sink_handle
-                        .send((data,
-                               MetaData {
-                                   flags: t.flags(),
-                                   id,
-                               }))
-                        .and_then(|s| Close::new(s)))
-    }
-}
-
-impl<'owner, W: AsyncWrite, B: AsRef<[u8]>> Future for SendRequest<'owner, W, B> {
-    type Item = ();
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.0.poll() {
-            Ok(Async::Ready(_)) => Ok(Async::Ready(())),
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(e) => Err(e),
-        }
-    }
-}
-
-/// A response that will be received from the peer.
-pub struct InResponse<'owner, R: 'owner + AsyncRead>(KeyHandle<'owner,
-                                                                PSCodecStream<R>,
-                                                                PacketId,
-                                                                fn(&DecodedPacket) -> PacketId>);
-
-impl<'owner, R: AsyncRead> InResponse<'owner, R> {
-    fn new(stream_handle: KeyHandle<'owner,
-                                    PSCodecStream<R>,
-                                    PacketId,
-                                    fn(&DecodedPacket) -> PacketId>)
-           -> InResponse<'owner, R> {
-        InResponse(stream_handle)
-    }
-}
-
-impl<'owner, R: AsyncRead> Future for InResponse<'owner, R> {
-    type Item = DecodedPacket;
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.0.poll() {
-            Ok(Async::Ready(Some(decoded_packet))) => Ok(Async::Ready(decoded_packet)),
-            Ok(Async::Ready(None)) => {
-                Err(io::Error::new(io::ErrorKind::UnexpectedEof,
-                                   "packet-stream closed before response was received"))
-            }
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(e) => Err(e),                      
-        }
-    }
-}
-
-pub struct PsIncoming<'owner, R: 'owner + AsyncRead, W: 'owner + AsyncWrite, B: 'owner> {
-    stream_handle:
-        DefaultHandle<'owner, PSCodecStream<R>, PacketId, fn(&DecodedPacket) -> PacketId>,
-    sink_handle: Handle<'owner, PSCodecSink<W, B>>,
-    shared: &'owner RefCell<Shared>,
-}
-
-impl<'owner, R: 'owner + AsyncRead, W: 'owner + AsyncWrite, B: AsRef<[u8]>> PsIncoming<'owner,
-                                                                                       R,
-                                                                                       W,
-                                                                                       B> {
-    fn new(owner: &'owner PsOwner<R, W, B>) -> PsIncoming<'owner, R, W, B> {
-        PsIncoming {
-            stream_handle: owner.stream.default_handle(),
-            sink_handle: owner.sink.handle(),
-            shared: &owner.state,
-        }
-    }
-}
-
-impl<'owner, R: 'owner + AsyncRead, W: 'owner + AsyncWrite, B> Stream
-    for PsIncoming<'owner, R, W, B> {
-    type Item = IncomingPacket<'owner, W, B>;
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        let mut shared = self.shared.borrow_mut();
-        match try_ready!(self.stream_handle.poll()) {
+    fn poll(&mut self) -> Poll<Option<IncomingPacket<W, B>>, io::Error> {
+        match try_ready!(self.stream.poll()) {
             Some(p) => {
-                if p.id() == shared.accepted_id {
-                    shared.increment_accepted();
+                if p.id() == self.accepted_id {
+                    self.increment_accepted();
                     if p.is_stream_packet() {
-                        unimplemented!()
+                        unimplemented!() // TODO
                         // Ok(Async::Ready(Some(IncomingPacket::Duplex(PsDuplex::new(p,
                         //                                             self.stream_handle
                         //                                                 .key_handle(p.id()))))))
                     } else {
-                        Ok(Async::Ready(Some(IncomingPacket::Request(InRequest::new(p, self.sink_handle.clone())))))
+                        Ok(Async::Ready(Some(IncomingPacket::Request(InRequest::new(p, self.sink.clone())))))
                     }
                 } else {
                     // Packet is neither an incoming request nor does it open
@@ -255,29 +124,127 @@ impl<'owner, R: 'owner + AsyncRead, W: 'owner + AsyncWrite, B> Stream
     }
 }
 
+/// Allows sending packets to the peer.
+pub struct PsOut<R: AsyncRead, W, B>(Rc<RefCell<PS<R, W, B>>>);
+
+impl<R, W, B> PsOut<R, W, B>
+    where R: AsyncRead,
+          W: AsyncWrite,
+          B: AsRef<[u8]>
+{
+    /// Send a request to the peer.
+    ///
+    /// The `SendRequest` Future must be polled to actually start sending the
+    /// request. The `InResponse` Future can be polled to receive the response.
+    pub fn request(&self, data: B, t: PsPacketType) -> (SendRequest<W, B>, InResponse<R>) {
+        let mut ps = self.0.borrow_mut();
+
+        let id = ps.next_id();
+        (SendRequest::new(ps.sink.clone(), data, t, id),
+         InResponse::new(ps.stream.key_handle(id * -1)))
+    }
+
+    // TODO create duplexes
+
+    pub fn close(&mut self) -> Poll<(), io::Error> {
+        self.0.borrow_mut().sink.close()
+    }
+}
+
+/// A request initated by this packet-stream.
+///
+/// Poll it to actually start sending the request.
+pub struct SendRequest<W: AsyncWrite, B: AsRef<[u8]>>(AndThen<Send<MPS<PSCodecSink<W, B>>>,
+                                                               Close<MPS<PSCodecSink<W, B>>>,
+                                                               fn(MPS<PSCodecSink<W, B>>)
+                                                                  -> Close<MPS<PSCodecSink<W,
+                                                                                            B>>>>);
+
+impl<W: AsyncWrite, B: AsRef<[u8]>> SendRequest<W, B> {
+    fn new(sink_handle: MPS<PSCodecSink<W, B>>,
+           data: B,
+           t: PsPacketType,
+           id: PacketId)
+           -> SendRequest<W, B> {
+        SendRequest(sink_handle
+                        .send((data,
+                               MetaData {
+                                   flags: t.flags(),
+                                   id,
+                               }))
+                        .and_then(|s| Close::new(s)))
+    }
+}
+
+impl<W: AsyncWrite, B: AsRef<[u8]>> Future for SendRequest<W, B> {
+    type Item = ();
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        try_ready!(self.0.poll());
+        Ok(Async::Ready(()))
+    }
+}
+
+/// A response that will be received from the peer.
+pub struct InResponse<R: AsyncRead>(KeyMCS<PSCodecStream<R>,
+                                            PacketId,
+                                            fn(&DecodedPacket) -> PacketId>);
+
+impl<R: AsyncRead> InResponse<R> {
+    fn new(stream_handle: KeyMCS<PSCodecStream<R>, PacketId, fn(&DecodedPacket) -> PacketId>)
+           -> InResponse<R> {
+        InResponse(stream_handle)
+    }
+}
+
+impl<R: AsyncRead> Future for InResponse<R> {
+    type Item = DecodedPacket;
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        match self.0.poll() {
+            Ok(Async::Ready(Some(decoded_packet))) => Ok(Async::Ready(decoded_packet)),
+            Ok(Async::Ready(None)) => {
+                Err(io::Error::new(io::ErrorKind::UnexpectedEof,
+                                   "packet-stream closed before response was received"))
+            }
+            Ok(Async::NotReady) => Ok(Async::NotReady),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// A stream of incoming requests from the peer.
+pub struct PsIn<R: AsyncRead, W, B>(Rc<RefCell<PS<R, W, B>>>);
+
+impl<R: AsyncRead, W: AsyncWrite, B: AsRef<[u8]>> Stream for PsIn<R, W, B> {
+    type Item = IncomingPacket<W, B>;
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        self.0.borrow_mut().poll()
+    }
+}
+
 /// An incoming packet, initiated by the peer.
-pub enum IncomingPacket<'owner, W: 'owner, B: 'owner> {
+pub enum IncomingPacket<W, B> {
     /// An incoming request.
-    Request(InRequest<'owner, W, B>),
+    Request(InRequest<W, B>),
     /// A duplex connection initiated by the peer.
     Duplex(PsDuplex<B>),
 }
 
 /// A request initated by the peer. Drop to ignore it, or use `respond` to send
 /// a response.
-pub struct InRequest<'owner, W: 'owner, B: 'owner> {
+pub struct InRequest<W, B> {
     packet: DecodedPacket,
-    sink_handle: Handle<'owner, PSCodecSink<W, B>>,
+    sink: MPS<PSCodecSink<W, B>>,
 }
 
-impl<'owner, W, B> InRequest<'owner, W, B> {
-    fn new(packet: DecodedPacket,
-           sink_handle: Handle<'owner, PSCodecSink<W, B>>)
-           -> InRequest<'owner, W, B> {
-        InRequest {
-            packet,
-            sink_handle,
-        }
+impl<W, B> InRequest<W, B> {
+    fn new(packet: DecodedPacket, sink: MPS<PSCodecSink<W, B>>) -> InRequest<W, B> {
+        InRequest { packet, sink }
     }
 
     /// Returns the packet corresponding to this incoming request.
@@ -286,29 +253,28 @@ impl<'owner, W, B> InRequest<'owner, W, B> {
     }
 }
 
-impl<'owner, W: AsyncWrite, B: AsRef<[u8]>> InRequest<'owner, W, B> {
+impl<W: AsyncWrite, B: AsRef<[u8]>> InRequest<W, B> {
     /// Returns a Future which completes once the given packet has been sent to
     /// the peer.
-    fn respond(self, bytes: B, t: PsPacketType) -> SendResponse<'owner, W, B> {
-        SendResponse::new(self.sink_handle, self.packet.id() * -1, bytes, t)
+    fn respond(self, bytes: B, t: PsPacketType) -> SendResponse<W, B> {
+        SendResponse::new(self.sink, self.packet.id() * -1, bytes, t)
     }
 }
 
 /// Future that completes when the given bytes have been sent as a response to
 /// the peer.
-pub struct SendResponse<'owner, W: 'owner + AsyncWrite, B: 'owner + AsRef<[u8]>>(AndThen<Send<Handle<'owner,
-                                                                           PSCodecSink<W, B>>>,
-                                                               Close<Handle<'owner,
-                                                                            PSCodecSink<W, B>>>,
-                                                               fn(Handle<'owner, PSCodecSink<W, B>>) -> Close<Handle<'owner,
-                                                                            PSCodecSink<W, B>>>>);
+pub struct SendResponse<W: AsyncWrite, B: AsRef<[u8]>>(AndThen<Send<MPS<PSCodecSink<W, B>>>,
+                                                                Close<MPS<PSCodecSink<W, B>>>,
+                                                                fn(MPS<PSCodecSink<W, B>>)
+                                                                   -> Close<MPS<PSCodecSink<W,
+                                                                                             B>>>>);
 
-impl<'owner, W: AsyncWrite, B: AsRef<[u8]>> SendResponse<'owner, W, B> {
-    fn new(sink_handle: Handle<'owner, PSCodecSink<W, B>>,
+impl<W: AsyncWrite, B: AsRef<[u8]>> SendResponse<W, B> {
+    fn new(sink_handle: MPS<PSCodecSink<W, B>>,
            id: PacketId,
            data: B,
            t: PsPacketType)
-           -> SendResponse<'owner, W, B> {
+           -> SendResponse<W, B> {
         debug_assert!(id < 0);
 
         SendResponse(sink_handle
@@ -321,7 +287,7 @@ impl<'owner, W: AsyncWrite, B: AsRef<[u8]>> SendResponse<'owner, W, B> {
     }
 }
 
-impl<'owner, W: AsyncWrite, B: AsRef<[u8]>> Future for SendResponse<'owner, W, B> {
+impl<W: AsyncWrite, B: AsRef<[u8]>> Future for SendResponse<W, B> {
     type Item = ();
     type Error = io::Error;
 
@@ -404,7 +370,7 @@ mod tests {
     use async_ringbuffer::*;
     use rand;
     use futures::stream::iter_ok;
-    use futures::future::{join_all, ok};
+    use futures::future::{join_all, ok, poll_fn};
 
     #[test]
     fn requests() {
@@ -430,31 +396,32 @@ mod tests {
         let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
         let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
         let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
-        let ps_a = PsOwner::new(reader_a, writer_a);
-        let incoming_a = ps_a.incoming();
 
         let (writer_b, reader_b) = ring_buffer(buf_size_b + 1);
         let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
         let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
-        let ps_b = PsOwner::new(reader_b, writer_b);
-        let incoming_b = ps_b.incoming();
 
-        let echo = ps_b.incoming()
-            .for_each(|incoming_packet| match incoming_packet {
-                          IncomingPacket::Request(in_request) => {
+        let (a_in, mut a_out) = packet_stream(reader_a, writer_b);
+        let (b_in, mut b_out) = packet_stream(reader_b, writer_a);
+
+        let echo = b_in.for_each(|incoming_packet| match incoming_packet {
+                                     IncomingPacket::Request(in_request) => {
                 let data = in_request.packet().data().clone();
                 in_request.respond(data, PsPacketType::Binary)
             }
-                          IncomingPacket::Duplex(_) => unreachable!(),
-                      });
+                                     IncomingPacket::Duplex(_) => unreachable!(),
+                                 })
+            .and_then(|_| poll_fn(|| b_out.close()));
 
-        let consume_a = ps_a.incoming().for_each(|_| ok(()));
+        let consume_a = a_in.for_each(|_| ok(()));
 
-        let (req0, res0) = ps_a.request([0], PsPacketType::Binary);
-        let (req1, res1) = ps_a.request([1], PsPacketType::Binary);
-        let (req2, res2) = ps_a.request([2], PsPacketType::Binary);
+        let (req0, res0) = a_out.request([0], PsPacketType::Binary);
+        let (req1, res1) = a_out.request([1], PsPacketType::Binary);
+        let (req2, res2) = a_out.request([2], PsPacketType::Binary);
 
-        let send_all = req0.join3(req1, req2);
+        let send_all = req0.join3(req1, req2)
+            .and_then(|_| poll_fn(|| a_out.close()));
+
         let receive_all = res0.join3(res1, res2)
             .map(|(r0, r1, r2)| {
                      return r0.data() == &vec![0u8] && r0.is_buffer_packet() &&
