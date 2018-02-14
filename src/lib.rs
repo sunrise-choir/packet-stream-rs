@@ -1,3 +1,4 @@
+//! Implements the [packet-stream protocol](https://github.com/ssbc/packet-stream) in rust.
 #![warn(missing_docs)]
 
 #[macro_use(try_ready)]
@@ -17,7 +18,10 @@ extern crate quickcheck;
 extern crate async_ringbuffer;
 #[cfg(test)]
 extern crate rand;
+#[cfg(test)]
+extern crate tokio;
 
 mod raw;
 mod codec;
-pub mod ps;
+mod ps;
+pub use ps::*;

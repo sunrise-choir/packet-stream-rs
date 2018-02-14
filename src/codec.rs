@@ -10,8 +10,6 @@ use tokio_io::{AsyncWrite, AsyncRead};
 use futures::{Future, Poll, Stream, Sink, StartSend, AsyncSink, Async};
 use futures::Async::{Ready, NotReady};
 
-use ps::PsPacketType;
-
 pub type PacketId = i32;
 
 pub struct MetaData {
@@ -20,9 +18,9 @@ pub struct MetaData {
 }
 
 // Flags
-static STREAM: u8 = 0b0000_1000;
-static END: u8 = 0b0000_0100;
-static TYPE: u8 = 0b0000_0011;
+pub static STREAM: u8 = 0b0000_1000;
+pub static END: u8 = 0b0000_0100;
+pub static TYPE: u8 = 0b0000_0011;
 
 pub static TYPE_BINARY: u8 = 0;
 pub static TYPE_STRING: u8 = 1;
@@ -56,10 +54,10 @@ impl<W, B: AsRef<[u8]>> WritePacket<W, B> {
         }
     }
 
-    pub fn into_inner(self) -> W {
-        self.write
-            .expect("Called into_inner on WritePacket future after completion")
-    }
+    // pub fn into_inner(self) -> W {
+    //     self.write
+    //         .expect("Called into_inner on WritePacket future after completion")
+    // }
 }
 
 // State for the WritePacket future.
@@ -190,10 +188,10 @@ impl<W> WriteZeros<W> {
         WriteZeros(0, Some(w))
     }
 
-    pub fn into_inner(self) -> W {
-        self.1
-            .expect("Called into_inner on WriteZeros future after completion")
-    }
+    // pub fn into_inner(self) -> W {
+    //     self.1
+    //         .expect("Called into_inner on WriteZeros future after completion")
+    // }
 }
 
 impl<W: AsyncWrite> Future for WriteZeros<W> {
@@ -246,14 +244,14 @@ impl<W, B: AsRef<[u8]>> PSCodecSink<W, B> {
         PSCodecSink { state: Some(SinkState::Waiting(write)) }
     }
 
-    pub fn into_inner(self) -> W {
-        match self.state.unwrap() {
-            SinkState::Waiting(w) => w,
-            SinkState::Writing(wp) => wp.into_inner(),
-            SinkState::Ending(wz) => wz.into_inner(),
-            SinkState::ShuttingDown(w) => w,
-        }
-    }
+    // pub fn into_inner(self) -> W {
+    //     match self.state.unwrap() {
+    //         SinkState::Waiting(w) => w,
+    //         SinkState::Writing(wp) => wp.into_inner(),
+    //         SinkState::Ending(wz) => wz.into_inner(),
+    //         SinkState::ShuttingDown(w) => w,
+    //     }
+    // }
 
     fn waiting(&mut self, w: W) {
         self.state = Some(SinkState::Waiting(w));

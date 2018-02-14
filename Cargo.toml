@@ -21,3 +21,4 @@ partial-io = { version = "0.2.5", features = ["quickcheck", "tokio"] }
 quickcheck = "0.4.1"
 async-ringbuffer = "0.1.0"
 rand = "0.3.18"
+tokio = "0.1"
