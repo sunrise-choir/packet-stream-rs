@@ -21,7 +21,6 @@ extern crate rand;
 #[cfg(test)]
 extern crate tokio;
 
-mod raw;
 mod codec;
 mod ps;
 pub use ps::*;
