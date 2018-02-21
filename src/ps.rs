@@ -16,6 +16,8 @@ use atm_async_utils::sink_futures::Close;
 
 use codec::*;
 
+pub use codec::DecodedPacket;
+
 /// An enumeration representing the different types a packet can have.
 #[derive(Clone, Copy)]
 pub enum PsPacketType {
@@ -109,9 +111,12 @@ impl<R, W, B> PS<R, W, B>
                 if p.id() == self.accepted_id {
                     self.increment_accepted();
                     if p.is_stream_packet() {
+                        let sink_id = p.id() * -1;
+                        let stream_id = p.id();
                         Ok(Async::Ready(Some(IncomingPacket::Duplex(
-                            PsSink::new(self.sink.clone(), p.id() * -1),
-                            PsStream::new(self.stream.key_handle(p.id()), Some(p))
+                            p,
+                            PsSink::new(self.sink.clone(), sink_id),
+                            PsStream::new(self.stream.key_handle(stream_id))
                         ))))
                     } else {
                         Ok(Async::Ready(Some(IncomingPacket::Request(InRequest::new(p, self.sink.clone())))))
@@ -153,7 +158,7 @@ impl<R, W, B> PsOut<R, W, B>
         let mut ps = self.0.borrow_mut();
 
         let id = ps.next_id();
-        (PsSink::new(ps.sink.clone(), id), PsStream::new(ps.stream.key_handle(id * -1), None))
+        (PsSink::new(ps.sink.clone(), id), PsStream::new(ps.stream.key_handle(id * -1)))
     }
 
     /// Close the packet-stream, indicating that no more packets will be sent.
@@ -283,14 +288,12 @@ impl<W, B> Sink for PsSink<W, B>
 /// The stream half of a duplex multiplexed over the packet-stream.
 pub struct PsStream<R: AsyncRead> {
     stream: KeyMCS<Fuse<PSCodecStream<R>>, PacketId, fn(&DecodedPacket) -> PacketId>,
-    initial: Option<DecodedPacket>,
 }
 
 impl<R: AsyncRead> PsStream<R> {
-    fn new(stream: KeyMCS<Fuse<PSCodecStream<R>>, PacketId, fn(&DecodedPacket) -> PacketId>,
-           initial: Option<DecodedPacket>)
+    fn new(stream: KeyMCS<Fuse<PSCodecStream<R>>, PacketId, fn(&DecodedPacket) -> PacketId>)
            -> PsStream<R> {
-        PsStream { stream, initial }
+        PsStream { stream }
     }
 }
 
@@ -303,16 +306,11 @@ impl<R: AsyncRead> Stream for PsStream<R> {
     /// Note that the stream never emits `Ok(Async::Ready(None))`, this needs to be
     /// implemented on top of it.
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        match self.initial.take() {
-            Some(p) => Ok(Async::Ready(Some(p))),
+        match try_ready!(self.stream.poll()) {
+            Some(packet) => Ok(Async::Ready(Some(packet))),
             None => {
-                match try_ready!(self.stream.poll()) {
-                    Some(packet) => Ok(Async::Ready(Some(packet))),
-                    None => {
-                        Err(io::Error::new(UnexpectedEof,
-                                           "packet stream closed while substream was waiting for items"))
-                    }
-                }
+                Err(io::Error::new(UnexpectedEof,
+                                   "packet stream closed while substream was waiting for items"))
             }
         }
     }
@@ -335,7 +333,7 @@ pub enum IncomingPacket<R: AsyncRead, W: AsyncWrite, B: AsRef<[u8]>> {
     /// An incoming request.
     Request(InRequest<W, B>),
     /// A duplex connection initiated by the peer.
-    Duplex(PsSink<W, B>, PsStream<R>),
+    Duplex(DecodedPacket, PsSink<W, B>, PsStream<R>),
 }
 
 /// A request initated by the peer. Drop to ignore it, or use `respond` to send
@@ -491,7 +489,7 @@ mod tests {
                 let data = in_request.packet().data().clone();
                 in_request.respond(data, PsPacketType::Binary)
             }
-                                     IncomingPacket::Duplex(_, _) => unreachable!(),
+                                     IncomingPacket::Duplex(_, _, _) => unreachable!(),
                                  })
             .and_then(|_| poll_fn(|| b_out.close()));
 
@@ -554,7 +552,7 @@ mod tests {
         let echo =
             b_in.for_each(|incoming_packet| match incoming_packet {
                               IncomingPacket::Request(_) => unreachable!(),
-                              IncomingPacket::Duplex(sink, stream) => {
+                              IncomingPacket::Duplex(_, sink, stream) => {
                                   stream
                                       .take_while(|packet| ok(!packet.is_end_packet()))
                                       .map(|packet| {
@@ -574,13 +572,16 @@ mod tests {
 
         let send_0 =
             sink0_a.send_all(iter_ok::<_, io::Error>(vec![(vec![0], PsPacketType::Binary, false),
+                                                          (vec![0], PsPacketType::Binary, false),
                                                           (vec![42], PsPacketType::Binary, true)]));
         let send_1 =
             sink1_a.send_all(iter_ok::<_, io::Error>(vec![(vec![1], PsPacketType::Binary, false),
                                                           (vec![1], PsPacketType::Binary, false),
+                                                          (vec![1], PsPacketType::Binary, false),
                                                           (vec![43], PsPacketType::Binary, true)]));
         let send_2 =
             sink2_a.send_all(iter_ok::<_, io::Error>(vec![(vec![2], PsPacketType::Binary, false),
+                                                          (vec![2], PsPacketType::Binary, false),
                                                           (vec![2], PsPacketType::Binary, false),
                                                           (vec![2], PsPacketType::Binary, false),
                                                           (vec![44], PsPacketType::Binary, true)]));
