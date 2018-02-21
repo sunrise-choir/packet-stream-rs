@@ -718,7 +718,7 @@ mod tests {
         assert!(!decoded_packet.is_end_packet());
         assert!(decoded_packet.is_buffer_packet());
         assert_eq!(decoded_packet.id(), id);
-        assert_eq!(decoded_packet.into_data(), expected_data);
+        assert_eq!(decoded_packet.into_data(), expected_data.into_boxed_slice());
 
         return true;
     }
@@ -797,7 +797,7 @@ mod tests {
             if (i as PacketId) != decoded_packet.id() || decoded_packet.is_stream_packet() ||
                decoded_packet.is_end_packet() ||
                (!decoded_packet.is_buffer_packet() ||
-                decoded_packet.data() != &vec![expected_data[i]]) {
+                decoded_packet.data() != &vec![expected_data[i]].into_boxed_slice()) {
                 return false;
             }
         }

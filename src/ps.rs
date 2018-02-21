@@ -506,10 +506,10 @@ mod tests {
 
         let receive_all = res0.join3(res1, res2)
             .map(|(r0, r1, r2)| {
-                     return r0.data() == &vec![0u8] && r0.is_buffer_packet() &&
-                            r1.data() == &vec![1u8] &&
+                     return r0.data() == &vec![0u8].into_boxed_slice() && r0.is_buffer_packet() &&
+                            r1.data() == &vec![1u8].into_boxed_slice() &&
                             r1.is_buffer_packet() &&
-                            r2.data() == &vec![2u8] &&
+                            r2.data() == &vec![2u8].into_boxed_slice() &&
                             r2.is_buffer_packet();
                  });
 
@@ -588,20 +588,22 @@ mod tests {
             .join3(send_1, send_2)
             .and_then(move |_| poll_fn(move || a_out.close()));
 
-        let receive_0 = stream0_a
-            .take(1)
-            .fold(false,
-                  |_, packet| ok::<_, io::Error>(packet.into_data() == vec![0]));
-        let receive_1 =
-            stream1_a
-                .take(2)
-                .fold(true,
-                      |acc, packet| ok::<_, io::Error>(acc && packet.into_data() == vec![1]));
-        let receive_2 =
-            stream2_a
-                .take(3)
-                .fold(true,
-                      |acc, packet| ok::<_, io::Error>(acc && packet.into_data() == vec![2]));
+        let receive_0 =
+            stream0_a
+                .take(1)
+                .fold(false, |_, packet| {
+                    ok::<_, io::Error>(packet.into_data() == vec![0].into_boxed_slice())
+                });
+        let receive_1 = stream1_a
+            .take(2)
+            .fold(true, |acc, packet| {
+                ok::<_, io::Error>(acc && packet.into_data() == vec![1].into_boxed_slice())
+            });
+        let receive_2 = stream2_a
+            .take(3)
+            .fold(true, |acc, packet| {
+                ok::<_, io::Error>(acc && packet.into_data() == vec![2].into_boxed_slice())
+            });
         let receive_all = receive_0
             .join3(receive_1, receive_2)
             .map(|(a, b, c)| a && b && c);
