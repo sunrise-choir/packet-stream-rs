@@ -413,7 +413,7 @@ impl<W: AsyncWrite, B: AsRef<[u8]>> Sink for PSCodecSink<W, B> {
 pub struct DecodedPacket {
     flags: u8,
     id: PacketId,
-    bytes: Vec<u8>,
+    bytes: Box<[u8]>,
 }
 
 impl DecodedPacket {
@@ -448,17 +448,17 @@ impl DecodedPacket {
     }
 
     /// Returns a reference to the packet's data.
-    pub fn data(&self) -> &Vec<u8> {
+    pub fn data(&self) -> &Box<[u8]> {
         &self.bytes
     }
 
     /// Returns a mutable reference to the packet's data.
-    pub fn data_mut(&mut self) -> &mut Vec<u8> {
+    pub fn data_mut(&mut self) -> &mut Box<[u8]> {
         &mut self.bytes
     }
 
     /// Consumes the packet and gives ownership of its data.
-    pub fn into_data(self) -> Vec<u8> {
+    pub fn into_data(self) -> Box<[u8]> {
         self.bytes
     }
 }
@@ -466,7 +466,7 @@ impl DecodedPacket {
 /// A Future used to read a packet from an AsyncRead
 struct ReadPacket<R> {
     read: Option<R>,
-    packet: Option<DecodedPacket>,
+    packet: Option<(u8, PacketId, Vec<u8>)>,
     state: ReadPacketState,
 }
 
@@ -475,11 +475,7 @@ impl<R> ReadPacket<R> {
     pub fn new(read: R) -> ReadPacket<R> {
         ReadPacket {
             read: Some(read),
-            packet: Some(DecodedPacket {
-                             flags: 0,
-                             id: 0,
-                             bytes: Vec::new(),
-                         }),
+            packet: Some((0, 0, Vec::new())),
             state: ReadPacketState::ReadFlags,
         }
     }
@@ -512,8 +508,8 @@ impl<R: AsyncRead> Future for ReadPacket<R> {
                             return Err(Error::new(UnexpectedEof, "failed to read packet flags"));
                         }
                         Ok(_) => {
-                            packet.flags = read_buf[0];
-                            if (packet.flags & TYPE) == TYPE_INVALID {
+                            packet.0 = read_buf[0];
+                            if (packet.0 & TYPE) == TYPE_INVALID {
                                 return Err(Error::new(InvalidData,
                                                       "read packet with invalid type flag"));
                             }
@@ -583,24 +579,24 @@ impl<R: AsyncRead> Future for ReadPacket<R> {
                     }
                 }
 
-                packet.id = i32::from_be(unsafe { transmute::<[u8; 4], i32>(id_buf) });
+                packet.1 = i32::from_be(unsafe { transmute::<[u8; 4], i32>(id_buf) });
 
-                if (length == 0) && (packet.id == 0) && (packet.flags == 0) {
+                if (length == 0) && (packet.1 == 0) && (packet.0 == 0) {
                     return Ok(Ready((None, r)));
                 }
 
                 self.state = ReadPacketState::ReadBytes(length);
-                packet.bytes.reserve_exact(length as usize);
+                packet.2.reserve_exact(length as usize);
                 self.read = Some(r);
                 self.packet = Some(packet);
                 return self.poll();
             }
 
             ReadPacketState::ReadBytes(length) => {
-                let mut old_len = packet.bytes.len();
+                let mut old_len = packet.2.len();
 
-                let capacity = packet.bytes.capacity();
-                let data_ptr = packet.bytes.as_mut_slice().as_mut_ptr();
+                let capacity = packet.2.capacity();
+                let data_ptr = packet.2.as_mut_slice().as_mut_ptr();
                 let data_slice = unsafe { from_raw_parts_mut(data_ptr, capacity) };
 
                 while old_len < length as usize {
@@ -610,7 +606,7 @@ impl<R: AsyncRead> Future for ReadPacket<R> {
                                                   "failed to read whole packet content"));
                         }
                         Ok(read) => {
-                            unsafe { packet.bytes.set_len(old_len + read) };
+                            unsafe { packet.2.set_len(old_len + read) };
                             old_len += read;
                         }
                         Err(ref e) if e.kind() == WouldBlock => {
@@ -623,7 +619,12 @@ impl<R: AsyncRead> Future for ReadPacket<R> {
                     }
                 }
 
-                return Ok(Ready((Some(packet), r)));
+                return Ok(Ready((Some(DecodedPacket {
+                                          flags: packet.0,
+                                          id: packet.1,
+                                          bytes: packet.2.into_boxed_slice(),
+                                      }),
+                                 r)));
             }
         }
     }
