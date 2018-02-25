@@ -1,12 +1,10 @@
 //! Implements the [packet-stream protocol](https://github.com/ssbc/packet-stream) in rust.
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 #[macro_use(try_ready)]
 extern crate futures;
 extern crate tokio_io;
-extern crate atm_io_utils;
 extern crate atm_async_utils;
-// extern crate void; TODO check for unneeded extern crates
 extern crate multi_producer_sink;
 extern crate multi_consumer_stream;
 extern crate packet_stream_codec;
@@ -19,8 +17,6 @@ extern crate quickcheck;
 extern crate async_ringbuffer;
 #[cfg(test)]
 extern crate rand;
-#[cfg(test)]
-extern crate tokio;
 
 use std::cell::RefCell;
 use std::i32::MAX;
@@ -65,11 +61,21 @@ impl PacketType {
 /// exposed.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Metadata {
-    packet_type: PacketType,
-    is_end: bool,
+    /// The type of the packet.
+    pub packet_type: PacketType,
+    /// Whether the packet has the end/error flag set.
+    pub is_end: bool,
 }
 
 impl Metadata {
+    /// Create new `Metadata`.
+    pub fn new(packet_type: PacketType, is_end: bool) -> Metadata {
+        Metadata {
+            packet_type,
+            is_end,
+        }
+    }
+
     fn flags(&self) -> u8 {
         if self.is_end {
             self.packet_type.flags() | END
@@ -309,7 +315,7 @@ impl<W, B> Sink for PsSink<W, B>
     type SinkError = Option<io::Error>;
 
     fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        let mut flags = item.1.flags() | STREAM;
+        let flags = item.1.flags() | STREAM;
 
         match self.sink
                   .start_send((item.0, packet_stream_codec::Metadata { flags, id: self.id })) {
@@ -489,178 +495,179 @@ impl<W: AsyncWrite, B: AsRef<[u8]>> Future for OutResponse<W, B> {
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     use partial_io::{PartialAsyncRead, PartialAsyncWrite, PartialWithErrors};
-//     use partial_io::quickcheck_types::GenInterruptedWouldBlock;
-//     use quickcheck::{QuickCheck, StdGen};
-//     use async_ringbuffer::*;
-//     use rand;
-//     use futures::stream::iter_ok;
-//     use futures::future::{ok, poll_fn};
-//
-//     #[test]
-//     fn requests() {
-//         let rng = StdGen::new(rand::thread_rng(), 20);
-//         let mut quickcheck = QuickCheck::new().gen(rng).tests(100);
-//         quickcheck.quickcheck(test_requests as
-//                               fn(usize,
-//                                  usize,
-//                                  PartialWithErrors<GenInterruptedWouldBlock>,
-//                                  PartialWithErrors<GenInterruptedWouldBlock>,
-//                                  PartialWithErrors<GenInterruptedWouldBlock>,
-//                                  PartialWithErrors<GenInterruptedWouldBlock>)
-//                                  -> bool);
-//     }
-//
-//     fn test_requests(buf_size_a: usize,
-//                      buf_size_b: usize,
-//                      write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-//                      read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-//                      write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
-//                      read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
-//                      -> bool {
-//         let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
-//         let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
-//         let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
-//
-//         let (writer_b, reader_b) = ring_buffer(buf_size_b + 1);
-//         let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
-//         let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
-//
-//         let (a_in, mut a_out) = packet_stream(reader_a, writer_b);
-//         let (b_in, mut b_out) = packet_stream(reader_b, writer_a);
-//
-//         let echo = b_in.for_each(|incoming_packet| match incoming_packet {
-//                                      IncomingPacket::Request(in_request) => {
-//                 let data = in_request.packet().data().clone();
-//                 in_request.respond(data, PacketType::Binary)
-//             }
-//                                      IncomingPacket::Duplex(_, _, _) => unreachable!(),
-//                                  })
-//             .and_then(|_| poll_fn(|| b_out.close()));
-//
-//         let consume_a = a_in.for_each(|_| ok(()));
-//
-//         let (req0, res0) = a_out.request([0], PacketType::Binary);
-//         let (req1, res1) = a_out.request([1], PacketType::Binary);
-//         let (req2, res2) = a_out.request([2], PacketType::Binary);
-//
-//         let send_all = req0.join3(req1, req2)
-//             .and_then(|_| poll_fn(|| a_out.close()));
-//
-//         let receive_all = res0.join3(res1, res2)
-//             .map(|(r0, r1, r2)| {
-//                      return r0.data() == &vec![0u8].into_boxed_slice() && r0.is_buffer_packet() &&
-//                             r1.data() == &vec![1u8].into_boxed_slice() &&
-//                             r1.is_buffer_packet() &&
-//                             r2.data() == &vec![2u8].into_boxed_slice() &&
-//                             r2.is_buffer_packet();
-//                  });
-//
-//         return echo.join4(consume_a, send_all, receive_all)
-//                    .map(|(_, _, _, worked)| worked)
-//                    .wait()
-//                    .unwrap();
-//     }
-//
-//     #[test]
-//     fn duplexes() {
-//         let rng = StdGen::new(rand::thread_rng(), 20);
-//         let mut quickcheck = QuickCheck::new().gen(rng).tests(100);
-//         quickcheck.quickcheck(test_duplexes as
-//                               fn(usize,
-//                                  usize,
-//                                  PartialWithErrors<GenInterruptedWouldBlock>,
-//                                  PartialWithErrors<GenInterruptedWouldBlock>,
-//                                  PartialWithErrors<GenInterruptedWouldBlock>,
-//                                  PartialWithErrors<GenInterruptedWouldBlock>)
-//                                  -> bool);
-//     }
-//
-//     fn test_duplexes(buf_size_a: usize,
-//                      buf_size_b: usize,
-//                      write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-//                      read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-//                      write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
-//                      read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
-//                      -> bool {
-//         let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
-//         let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
-//         let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
-//
-//         let (writer_b, reader_b) = ring_buffer(buf_size_b + 1);
-//         let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
-//         let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
-//
-//         let (a_in, mut a_out) = packet_stream(reader_a, writer_b);
-//         let (b_in, mut b_out) = packet_stream(reader_b, writer_a);
-//
-//         let echo =
-//             b_in.for_each(|incoming_packet| match incoming_packet {
-//                               IncomingPacket::Request(_) => unreachable!(),
-//                               IncomingPacket::Duplex(_, sink, stream) => {
-//                                   stream
-//                                       .take_while(|packet| ok(!packet.is_end_packet()))
-//                                       .map(|packet| {
-//                                                (packet.into_data(), PacketType::Binary, false)
-//                                            })
-//                                       .forward(sink)
-//                                       .map(|_| ())
-//                               }
-//                           })
-//                 .and_then(move |_| poll_fn(move || b_out.close()));
-//
-//         let consume_a = a_in.for_each(|_| ok(()));
-//
-//         let (sink0_a, stream0_a) = a_out.duplex();
-//         let (sink1_a, stream1_a) = a_out.duplex();
-//         let (sink2_a, stream2_a) = a_out.duplex();
-//
-//         let send_0 =
-//             sink0_a.send_all(iter_ok::<_, io::Error>(vec![(vec![0], PacketType::Binary, false),
-//                                                           (vec![0], PacketType::Binary, false),
-//                                                           (vec![42], PacketType::Binary, true)]));
-//         let send_1 =
-//             sink1_a.send_all(iter_ok::<_, io::Error>(vec![(vec![1], PacketType::Binary, false),
-//                                                           (vec![1], PacketType::Binary, false),
-//                                                           (vec![1], PacketType::Binary, false),
-//                                                           (vec![43], PacketType::Binary, true)]));
-//         let send_2 =
-//             sink2_a.send_all(iter_ok::<_, io::Error>(vec![(vec![2], PacketType::Binary, false),
-//                                                           (vec![2], PacketType::Binary, false),
-//                                                           (vec![2], PacketType::Binary, false),
-//                                                           (vec![2], PacketType::Binary, false),
-//                                                           (vec![44], PacketType::Binary, true)]));
-//         let send_all = send_0
-//             .join3(send_1, send_2)
-//             .and_then(move |_| poll_fn(move || a_out.close()));
-//
-//         let receive_0 =
-//             stream0_a
-//                 .take(1)
-//                 .fold(false, |_, packet| {
-//                     ok::<_, io::Error>(packet.into_data() == vec![0].into_boxed_slice())
-//                 });
-//         let receive_1 = stream1_a
-//             .take(2)
-//             .fold(true, |acc, packet| {
-//                 ok::<_, io::Error>(acc && packet.into_data() == vec![1].into_boxed_slice())
-//             });
-//         let receive_2 = stream2_a
-//             .take(3)
-//             .fold(true, |acc, packet| {
-//                 ok::<_, io::Error>(acc && packet.into_data() == vec![2].into_boxed_slice())
-//             });
-//         let receive_all = receive_0
-//             .join3(receive_1, receive_2)
-//             .map(|(a, b, c)| a && b && c);
-//
-//         return echo.join4(consume_a, send_all, receive_all)
-//                    .map(|(_, _, _, worked)| worked)
-//                    .wait()
-//                    .unwrap();
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use partial_io::{PartialAsyncRead, PartialAsyncWrite, PartialWithErrors};
+    use partial_io::quickcheck_types::GenInterruptedWouldBlock;
+    use quickcheck::{QuickCheck, StdGen};
+    use async_ringbuffer::*;
+    use rand;
+    use futures::stream::iter_ok;
+    use futures::future::{ok, poll_fn};
+
+    #[test]
+    fn requests() {
+        let rng = StdGen::new(rand::thread_rng(), 20);
+        let mut quickcheck = QuickCheck::new().gen(rng).tests(1000);
+        quickcheck.quickcheck(test_requests as
+                              fn(usize,
+                                 usize,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>)
+                                 -> bool);
+    }
+
+    fn test_requests(buf_size_a: usize,
+                     buf_size_b: usize,
+                     write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
+                     read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
+                     write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
+                     read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
+                     -> bool {
+        let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
+        let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
+        let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
+
+        let (writer_b, reader_b) = ring_buffer(buf_size_b + 1);
+        let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
+        let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
+
+        let (a_in, mut a_out, _) = packet_stream(reader_a, writer_b);
+        let (b_in, mut b_out, _) = packet_stream(reader_b, writer_a);
+
+        let echo = b_in.for_each(|(data, metadata, in_packet)| match in_packet {
+                                     IncomingPacket::Request(in_request) => {
+                                         in_request
+                                             .respond(data, metadata)
+                                             .map_err(|_| unreachable!())
+                                     }
+                                     IncomingPacket::Duplex(_, _) => unreachable!(),
+                                 })
+            .and_then(|_| poll_fn(|| b_out.close()).map_err(|_| unreachable!()));
+
+        let consume_a = a_in.for_each(|_| ok(()));
+
+        let (req0, res0) = a_out.request([0], PacketType::Binary);
+        let (req1, res1) = a_out.request([1], PacketType::Binary);
+        let (req2, res2) = a_out.request([2], PacketType::Binary);
+
+        let send_all = req0.join3(req1, req2)
+            .and_then(|_| poll_fn(|| a_out.close()));
+
+        let receive_all = res0.join3(res1, res2)
+            .map(|((r0_data, r0_meta), (r1_data, r1_meta), (r2_data, r2_meta))| {
+                     return r0_data == vec![0u8].into_boxed_slice() &&
+                            r0_meta.packet_type == PacketType::Binary &&
+                            r1_data == vec![1u8].into_boxed_slice() &&
+                            r1_meta.packet_type == PacketType::Binary &&
+                            r2_data == vec![2u8].into_boxed_slice() &&
+                            r2_meta.packet_type == PacketType::Binary;
+                 });
+
+        return echo.join4(consume_a.map_err(|_| unreachable!()),
+                          send_all.map_err(|_| unreachable!()),
+                          receive_all.map_err(|_| unreachable!()))
+                   .map(|(_, _, _, worked)| worked)
+                   .wait()
+                   .unwrap();
+    }
+
+    #[test]
+    fn duplexes() {
+        let rng = StdGen::new(rand::thread_rng(), 20);
+        let mut quickcheck = QuickCheck::new().gen(rng).tests(100);
+        quickcheck.quickcheck(test_duplexes as
+                              fn(usize,
+                                 usize,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>)
+                                 -> bool);
+    }
+
+    fn test_duplexes(buf_size_a: usize,
+                     buf_size_b: usize,
+                     write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
+                     read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
+                     write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
+                     read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
+                     -> bool {
+        let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
+        let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
+        let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
+
+        let (writer_b, reader_b) = ring_buffer(buf_size_b + 1);
+        let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
+        let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
+
+        let (a_in, mut a_out, _) = packet_stream(reader_a, writer_b);
+        let (b_in, mut b_out, _) = packet_stream(reader_b, writer_a);
+
+        let non_end = Metadata::new(PacketType::Binary, false);
+        let end = Metadata::new(PacketType::Binary, true);
+
+        let echo =
+            b_in.map_err(|_| unreachable!())
+                .for_each(|(_, _, in_packet)| match in_packet {
+                              IncomingPacket::Request(_) => unreachable!(),
+                              IncomingPacket::Duplex(sink, stream) => {
+                                  stream
+                                      .map_err::<Option<io::Error>, _>(|_| None)
+                                      .take_while(|&(_, metadata)| ok(!metadata.is_end))
+                                      .map(|(data, _)| (data, non_end))
+                                      .forward(sink)
+                                      .map(|_| ())
+                              }
+                          })
+                .and_then(move |_| poll_fn(move || b_out.close()).map_err(|_| unreachable!()));
+
+        let consume_a = a_in.for_each(|_| ok(()));
+
+        let (sink0_a, stream0_a) = a_out.duplex();
+        let (sink1_a, stream1_a) = a_out.duplex();
+        let (sink2_a, stream2_a) = a_out.duplex();
+
+        let send_0 = sink0_a.send_all(iter_ok::<_, io::Error>(vec![(vec![0], non_end),
+                                                                   (vec![0], non_end),
+                                                                   (vec![42], end)]));
+        let send_1 = sink1_a.send_all(iter_ok::<_, io::Error>(vec![(vec![1], non_end),
+                                                                   (vec![1], non_end),
+                                                                   (vec![1], non_end),
+                                                                   (vec![43], end)]));
+        let send_2 = sink2_a.send_all(iter_ok::<_, io::Error>(vec![(vec![2], non_end),
+                                                                   (vec![2], non_end),
+                                                                   (vec![2], non_end),
+                                                                   (vec![2], non_end),
+                                                                   (vec![44], end)]));
+        let send_all = send_0
+            .join3(send_1, send_2)
+            .and_then(move |_| poll_fn(move || a_out.close()));
+
+        let receive_0 = stream0_a
+            .take(1)
+            .fold(false, |_, (data, _)| ok(data == vec![0].into_boxed_slice()));
+        let receive_1 = stream1_a
+            .take(2)
+            .fold(true,
+                  |acc, (data, _)| ok(acc && data == vec![1].into_boxed_slice()));
+        let receive_2 = stream2_a
+            .take(3)
+            .fold(true,
+                  |acc, (data, _)| ok(acc && data == vec![2].into_boxed_slice()));
+        let receive_all = receive_0
+            .join3(receive_1, receive_2)
+            .map(|(a, b, c)| a && b && c);
+
+        return echo.join4(consume_a.map_err(|_| unreachable!()),
+                          send_all.map_err(|_| unreachable!()),
+                          receive_all.map_err(|_| unreachable!()))
+                   .map(|(_, _, _, worked)| worked)
+                   .wait()
+                   .unwrap();
+    }
+}
