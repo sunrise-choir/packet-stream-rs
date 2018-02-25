@@ -17,14 +17,20 @@ pub struct MetaData {
     pub id: PacketId,
 }
 
-// Flags
+///  Bitmask for the stream flag.
 pub static STREAM: u8 = 0b0000_1000;
+///  Bitmask for the end flag.
 pub static END: u8 = 0b0000_0100;
+///  Bitmask for the type flags.
 pub static TYPE: u8 = 0b0000_0011;
 
+/// Value of the binary type.
 pub static TYPE_BINARY: u8 = 0;
+/// Value of the string type.
 pub static TYPE_STRING: u8 = 1;
+/// Value of the json type.
 pub static TYPE_JSON: u8 = 2;
+/// The unused fourth possible value.
 static TYPE_INVALID: u8 = 3;
 
 /// A Future used to write an entire packet into an AsyncWrite.
