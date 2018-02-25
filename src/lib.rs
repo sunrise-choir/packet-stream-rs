@@ -22,6 +22,8 @@ use std::cell::RefCell;
 use std::i32::MAX;
 use std::io;
 use std::rc::Rc;
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
 
 use atm_async_utils::sink_futures::Close;
 use futures::{Future, Sink, Stream, Poll, Async, StartSend, AsyncSink};
@@ -335,12 +337,31 @@ impl<W, B> Sink for PsSink<W, B>
 }
 
 /// An error indicating what happend on a connection.
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum ConnectionError {
     /// The peer closed the connection even though this substream was still
     /// waiting for data.
     Closed,
     /// The connection errored.
     Errored,
+}
+
+impl Display for ConnectionError {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
+        match *self {
+            ConnectionError::Closed => write!(f, "ConnectionError::Closed"),
+            ConnectionError::Errored => write!(f, "ConnectionError::Errored"),
+        }
+    }
+}
+
+impl Error for ConnectionError {
+    fn description(&self) -> &str {
+        match *self {
+            ConnectionError::Closed => "Peer closed its write-half of the packet-stream",
+            ConnectionError::Errored => "An error occuded on the packet-stream",
+        }
+    }
 }
 
 type StreamHandle<R> = KeyMCS<CodecStream<R>,
