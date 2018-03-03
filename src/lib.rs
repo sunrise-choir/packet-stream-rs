@@ -25,10 +25,8 @@ use std::rc::Rc;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use atm_async_utils::sink_futures::Close;
+use atm_async_utils::sink_futures::SendClose;
 use futures::{Future, Sink, Stream, Poll, Async, StartSend, AsyncSink};
-use futures::future::AndThen;
-use futures::sink::Send;
 use futures::unsync::oneshot::Canceled;
 use multi_producer_sink::{mps, MPS};
 use multi_consumer_stream::*;
@@ -424,10 +422,7 @@ impl<W: AsyncWrite, B: AsRef<[u8]>> InRequest<W, B> {
 /// An outgoing request, initated by this packet-stream.
 ///
 /// Poll it to actually start sending the request.
-pub struct OutRequest<W: AsyncWrite, B: AsRef<[u8]>>(AndThen<Send<MPS<CodecSink<W, B>>>,
-                                                              Close<MPS<CodecSink<W, B>>>,
-                                                              fn(MPS<CodecSink<W, B>>)
-                                                                 -> Close<MPS<CodecSink<W, B>>>>);
+pub struct OutRequest<W: AsyncWrite, B: AsRef<[u8]>>(SendClose<MPS<CodecSink<W, B>>>);
 
 impl<W: AsyncWrite, B: AsRef<[u8]>> OutRequest<W, B> {
     fn new(sink_handle: MPS<CodecSink<W, B>>,
@@ -435,13 +430,12 @@ impl<W: AsyncWrite, B: AsRef<[u8]>> OutRequest<W, B> {
            t: PacketType,
            id: PacketId)
            -> OutRequest<W, B> {
-        OutRequest(sink_handle
-                       .send((data,
-                              packet_stream_codec::Metadata {
-                                  flags: t.flags(),
-                                  id,
-                              }))
-                       .and_then(|s| Close::new(s)))
+        OutRequest(SendClose::new(sink_handle,
+                                  (data,
+                                   packet_stream_codec::Metadata {
+                                       flags: t.flags(),
+                                       id,
+                                   })))
     }
 }
 
@@ -486,10 +480,7 @@ impl<R: AsyncRead> Future for InResponse<R> {
 }
 
 /// Future that completes when the response has been sent to the peer.
-pub struct OutResponse<W: AsyncWrite, B: AsRef<[u8]>>(AndThen<Send<MPS<CodecSink<W, B>>>,
-                                                               Close<MPS<CodecSink<W, B>>>,
-                                                               fn(MPS<CodecSink<W, B>>)
-                                                                  -> Close<MPS<CodecSink<W, B>>>>);
+pub struct OutResponse<W: AsyncWrite, B: AsRef<[u8]>>(SendClose<MPS<CodecSink<W, B>>>);
 
 impl<W: AsyncWrite, B: AsRef<[u8]>> OutResponse<W, B> {
     fn new(sink: MPS<CodecSink<W, B>>,
@@ -499,8 +490,7 @@ impl<W: AsyncWrite, B: AsRef<[u8]>> OutResponse<W, B> {
            -> OutResponse<W, B> {
         debug_assert!(id < 0);
 
-        OutResponse(sink.send((data, metadata.to_codec_metadata(id)))
-                        .and_then(|s| Close::new(s)))
+        OutResponse(SendClose::new(sink, (data, metadata.to_codec_metadata(id))))
     }
 }
 
