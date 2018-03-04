@@ -273,7 +273,30 @@ impl<R, W, B> PsOut<R, W, B>
     ///
     /// The error contains a `None` if an `OutRequest`, `OutResponse` or
     /// `PsSink` errored previously.
-    pub fn close(&mut self) -> Poll<(), Option<io::Error>> {
+    pub fn close(self) -> ClosePs<R, W, B> {
+        ClosePs(self.0)
+    }
+}
+
+/// Future for closing the packet-stream, indicating that no more packets will be sent.
+///
+/// This does not immediately close if there are still unfinished
+/// `OutRequest`s, `OutResponse`s or `PsSink`s. In that case, the closing
+/// happens when the last of them finishes.
+///
+/// The error contains a `None` if an `OutRequest`, `OutResponse` or
+/// `PsSink` errored previously.
+pub struct ClosePs<R: AsyncRead, W, B>(Rc<RefCell<Shared<R, W, B>>>);
+
+impl<R, W, B> Future for ClosePs<R, W, B>
+    where R: AsyncRead,
+          W: AsyncWrite,
+          B: AsRef<[u8]>
+{
+    type Item = ();
+    type Error = Option<io::Error>;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         self.0.borrow_mut().sink.close()
     }
 }
@@ -516,7 +539,7 @@ mod tests {
     use async_ringbuffer::*;
     use rand;
     use futures::stream::iter_ok;
-    use futures::future::{ok, poll_fn};
+    use futures::future::ok;
 
     #[test]
     fn requests() {
@@ -547,8 +570,8 @@ mod tests {
         let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
         let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
 
-        let (a_in, mut a_out, _) = packet_stream(reader_a, writer_b);
-        let (b_in, mut b_out, _) = packet_stream(reader_b, writer_a);
+        let (a_in, a_out, _) = packet_stream(reader_a, writer_b);
+        let (b_in, b_out, _) = packet_stream(reader_b, writer_a);
 
         let echo = b_in.for_each(|(data, metadata, in_packet)| match in_packet {
                                      IncomingPacket::Request(in_request) => {
@@ -558,7 +581,7 @@ mod tests {
                                      }
                                      IncomingPacket::Duplex(_, _) => unreachable!(),
                                  })
-            .and_then(|_| poll_fn(|| b_out.close()).map_err(|_| unreachable!()));
+            .and_then(|_| b_out.close().map_err(|_| unreachable!()));
 
         let consume_a = a_in.for_each(|_| ok(()));
 
@@ -566,8 +589,7 @@ mod tests {
         let (req1, res1) = a_out.request([1], PacketType::Binary);
         let (req2, res2) = a_out.request([2], PacketType::Binary);
 
-        let send_all = req0.join3(req1, req2)
-            .and_then(|_| poll_fn(|| a_out.close()));
+        let send_all = req0.join3(req1, req2).and_then(|_| a_out.close());
 
         let receive_all = res0.join3(res1, res2)
             .map(|((r0_data, r0_meta), (r1_data, r1_meta), (r2_data, r2_meta))| {
@@ -616,26 +638,25 @@ mod tests {
         let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
         let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
 
-        let (a_in, mut a_out, _) = packet_stream(reader_a, writer_b);
-        let (b_in, mut b_out, _) = packet_stream(reader_b, writer_a);
+        let (a_in, a_out, _) = packet_stream(reader_a, writer_b);
+        let (b_in, b_out, _) = packet_stream(reader_b, writer_a);
 
         let non_end = Metadata::new(PacketType::Binary, false);
         let end = Metadata::new(PacketType::Binary, true);
 
-        let echo =
-            b_in.map_err(|_| unreachable!())
-                .for_each(|(_, _, in_packet)| match in_packet {
-                              IncomingPacket::Request(_) => unreachable!(),
-                              IncomingPacket::Duplex(sink, stream) => {
-                                  stream
-                                      .map_err::<Option<io::Error>, _>(|_| None)
-                                      .take_while(|&(_, metadata)| ok(!metadata.is_end))
-                                      .map(|(data, _)| (data, non_end))
-                                      .forward(sink)
-                                      .map(|_| ())
-                              }
-                          })
-                .and_then(move |_| poll_fn(move || b_out.close()).map_err(|_| unreachable!()));
+        let echo = b_in.map_err(|_| unreachable!())
+            .for_each(|(_, _, in_packet)| match in_packet {
+                          IncomingPacket::Request(_) => unreachable!(),
+                          IncomingPacket::Duplex(sink, stream) => {
+                              stream
+                                  .map_err::<Option<io::Error>, _>(|_| None)
+                                  .take_while(|&(_, metadata)| ok(!metadata.is_end))
+                                  .map(|(data, _)| (data, non_end))
+                                  .forward(sink)
+                                  .map(|_| ())
+                          }
+                      })
+            .and_then(|_| b_out.close().map_err(|_| unreachable!()));
 
         let consume_a = a_in.for_each(|_| ok(()));
 
@@ -655,9 +676,7 @@ mod tests {
                                                                    (vec![2], non_end),
                                                                    (vec![2], non_end),
                                                                    (vec![44], end)]));
-        let send_all = send_0
-            .join3(send_1, send_2)
-            .and_then(move |_| poll_fn(move || a_out.close()));
+        let send_all = send_0.join3(send_1, send_2).and_then(|_| a_out.close());
 
         let receive_0 = stream0_a
             .take(1)
