@@ -4,7 +4,6 @@
 extern crate atm_async_utils;
 #[macro_use]
 extern crate futures_core;
-extern crate futures_executor;
 extern crate futures_sink;
 extern crate futures_io;
 extern crate futures_util;
