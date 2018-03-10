@@ -1,38 +1,38 @@
 //! Implements the [packet-stream protocol](https://github.com/ssbc/packet-stream) in rust.
 #![deny(missing_docs)]
 
-#[macro_use(try_ready)]
-extern crate futures;
-extern crate tokio_io;
 extern crate atm_async_utils;
+#[macro_use]
+extern crate futures_core;
+extern crate futures_executor;
+extern crate futures_sink;
+extern crate futures_io;
+extern crate futures_util;
 extern crate multi_producer_sink;
 extern crate multi_consumer_stream;
 extern crate packet_stream_codec;
 
 #[cfg(test)]
-extern crate partial_io;
-#[cfg(test)]
-extern crate quickcheck;
-#[cfg(test)]
 extern crate async_ringbuffer;
 #[cfg(test)]
-extern crate rand;
+extern crate futures;
 
 use std::cell::RefCell;
 use std::i32::MAX;
-use std::io;
 use std::rc::Rc;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use atm_async_utils::sink_futures::SendClose;
-use futures::{Future, Sink, Stream, Poll, Async, StartSend, AsyncSink};
-use futures::unsync::oneshot::Canceled;
-use multi_producer_sink::{mps, MPS};
+use atm_async_utils::SendClose;
+use futures_core::{Future, Stream, Poll};
+use futures_core::Async::{Ready, Pending};
+use futures_core::task::Context;
+use futures_io::{AsyncRead, AsyncWrite, Error as IoError};
+use futures_sink::Sink;
+use multi_producer_sink::{mps, MPS, Done as MPSDone};
 use multi_consumer_stream::*;
 use packet_stream_codec::{PacketId, CodecSink, CodecStream, TYPE_BINARY, TYPE_STRING, TYPE_JSON,
-                          END, STREAM};
-use tokio_io::{AsyncRead, AsyncWrite};
+                          END, STREAM, Metadata as CodecMetadata};
 
 /// An enumeration representing the different types a packet can have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +84,7 @@ impl Metadata {
         }
     }
 
-    fn from_decoded_metadata(metadata: packet_stream_codec::Metadata) -> Metadata {
+    fn from_decoded_metadata(metadata: CodecMetadata) -> Metadata {
         let packet_type = if metadata.is_buffer_packet() {
             PacketType::Binary
         } else if metadata.is_string_packet() {
@@ -101,32 +101,34 @@ impl Metadata {
         }
     }
 
-    fn to_codec_metadata(self, id: PacketId) -> packet_stream_codec::Metadata {
-        packet_stream_codec::Metadata {
+    fn to_codec_metadata(self, id: PacketId) -> CodecMetadata {
+        CodecMetadata {
             flags: self.flags(),
             id,
         }
     }
 }
 
-/// A future that emits the wrapped writer of a packet-stream once the outgoing
-/// half of the stream has been fully closed.
-pub struct Closed<W, B>(multi_producer_sink::Closed<CodecSink<W, B>>);
+/// A future that emits the wrapped writer of a packet-stream once the outgoing half of the stream
+/// has been fully closed, it has errored, or once all references to it have been dropped.
+pub struct Done<W, B>(MPSDone<CodecSink<W, B>>);
 
-impl<W, B> Future for Closed<W, B> {
+impl<W, B> Future for Done<W, B> {
     type Item = W;
-    /// This can only be emitted if a previously polled/written `OutRequest`,
-    /// `OutResponse`s or `PsSink` is dropped whithout waiting for it to finish.
-    type Error = Canceled;
+    type Error = W;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        Ok(Async::Ready(try_ready!(self.0.poll()).into_inner()))
+    fn poll(&mut self, cx: &mut Context) -> Poll<Self::Item, Self::Error> {
+        match self.0.poll(cx) {
+            Ok(Ready(sink)) => Ok(Ready(sink.into_inner())),
+            Ok(Pending) => Ok(Pending),
+            Err(sink) => Err(sink.into_inner()),
+        }
     }
 }
 
-/// Take ownership of an AsyncRead and an AsyncWrite to create the two halves of
-/// a packet-stream, as well as a future for notification when the packet-stream
-/// has been fully closed.
+/// Take ownership of an AsyncRead and an AsyncWrite to create the two halves of a packet-stream,
+/// as well as a future for notification when the read-half of the packet-stream has been closed,
+/// errored or is not referenced anymore.
 ///
 /// `R` is the `AsyncRead` for reading bytes from the peer, `W` is the
 /// `AsyncWrite` for writing bytes to the peer, and `B` is the type that is used
@@ -134,7 +136,7 @@ impl<W, B> Future for Closed<W, B> {
 pub fn packet_stream<R: AsyncRead, W: AsyncWrite, B: AsRef<[u8]>>
     (r: R,
      w: W)
-     -> (PsIn<R, W, B>, PsOut<R, W, B>, Closed<W, B>) {
+     -> (PsIn<R, W, B>, PsOut<R, W, B>, Done<W, B>) {
     let (shared, closed) = Shared::new(r, w);
     let shared = Rc::new(RefCell::new(shared));
 
@@ -146,16 +148,22 @@ struct Shared<R, W, B>
     where R: AsyncRead
 {
     sink: MPS<CodecSink<W, B>>,
-    stream:
-        MCS<CodecStream<R>, PacketId, fn(&(Box<[u8]>, packet_stream_codec::Metadata)) -> PacketId>,
+    stream: MCS<CodecStream<R>,
+                PacketId,
+                fn(&(Box<[u8]>, CodecMetadata)) -> PacketId,
+                fn(&IoError) -> PacketId>,
     // The id used for the next actively sent packet.
     id_counter: PacketId,
     // The next id to be accepted as an active packet from the peer.
     accepted_id: PacketId,
 }
 
-fn get_id(item: &(Box<[u8]>, packet_stream_codec::Metadata)) -> PacketId {
+fn get_id(item: &(Box<[u8]>, CodecMetadata)) -> PacketId {
     item.1.id
+}
+
+fn const_zero(_: &IoError) -> PacketId {
+    0
 }
 
 impl<R, W, B> Shared<R, W, B>
@@ -163,15 +171,15 @@ impl<R, W, B> Shared<R, W, B>
           W: AsyncWrite,
           B: AsRef<[u8]>
 {
-    fn new(r: R, w: W) -> (Shared<R, W, B>, Closed<W, B>) {
-        let (sink, closed) = mps(CodecSink::new(w));
+    fn new(r: R, w: W) -> (Shared<R, W, B>, Done<W, B>) {
+        let (sink, done) = mps(CodecSink::new(w));
         (Shared {
              sink,
-             stream: mcs(CodecStream::new(r), get_id),
+             stream: MCS::new(CodecStream::new(r), get_id, const_zero),
              id_counter: 1,
              accepted_id: 1,
          },
-         Closed(closed))
+         Done(done))
     }
 
     fn next_id(&mut self) -> PacketId {
@@ -196,26 +204,32 @@ impl<R, W, B> Shared<R, W, B>
         }
     }
 
-    fn poll(&mut self) -> Poll<Option<(Box<[u8]>, Metadata, IncomingPacket<R, W, B>)>, io::Error> {
-        match try_ready!(self.stream.poll()) {
+    fn poll_next(&mut self,
+                 cx: &mut Context)
+                 -> Poll<Option<(Box<[u8]>, Metadata, IncomingPacket<R, W, B>)>, IoError> {
+        match try_ready!(self.stream.poll_next(cx)) {
             Some((data, metadata)) => {
                 if metadata.id == self.accepted_id {
                     self.increment_accepted();
                     if metadata.is_stream_packet() {
                         let sink_id = metadata.id * -1;
                         let stream_id = metadata.id;
-                        Ok(Async::Ready(Some((data, Metadata::from_decoded_metadata(metadata), IncomingPacket::Duplex(PsSink::new(self.sink.clone(), sink_id),
-                        PsStream::new(self.stream.key_handle(stream_id)))))))
+                        Ok(Ready(Some((data, Metadata::from_decoded_metadata(metadata), IncomingPacket::Duplex(PsSink::new(self.sink.clone(), sink_id),
+                        PsStream::new(self.stream.mcs_handle(stream_id)))))))
                     } else {
-                        Ok(Async::Ready(Some((data, Metadata::from_decoded_metadata(metadata), IncomingPacket::Request(InRequest::new(self.sink.clone(), metadata.id))))))
+                        Ok(Ready(Some((data,
+                                       Metadata::from_decoded_metadata(metadata),
+                                       IncomingPacket::Request(InRequest::new(self.sink
+                                                                                  .clone(),
+                                                                              metadata.id))))))
                     }
                 } else {
                     // Packet is neither an incoming request nor does it open
                     // a new stream, so ignore it
-                    self.poll()
+                    self.poll_next(cx)
                 }
             }
-            None => Ok(Async::Ready(None)),
+            None => Ok(Ready(None)),
         }
     }
 }
@@ -227,12 +241,10 @@ impl<R: AsyncRead, W: AsyncWrite, B: AsRef<[u8]>> Stream for PsIn<R, W, B> {
     /// The payload of the packet that triggered this emission, the metadata of
     /// the packet, and a way of interacting with the peer.
     type Item = (Box<[u8]>, Metadata, IncomingPacket<R, W, B>);
-    /// The first error of any `InResponse` or `PsStream` is emitted here.
-    /// Polling after the first error panics.
-    type Error = io::Error;
+    type Error = IoError;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        self.0.borrow_mut().poll()
+    fn poll_next(&mut self, cx: &mut Context) -> Poll<Option<Self::Item>, Self::Error> {
+        self.0.borrow_mut().poll_next(cx)
     }
 }
 
@@ -244,16 +256,12 @@ impl<R, W, B> PsOut<R, W, B>
           W: AsyncWrite,
           B: AsRef<[u8]>
 {
-    /// Send a request to the peer.
-    ///
-    /// The `OutRequest` Future must be polled to actually start sending the
-    /// request. The `InResponse` Future can be polled to receive the response.
-    pub fn request(&self, data: B, t: PacketType) -> (OutRequest<W, B>, InResponse<R>) {
+    /// Obtain a future for sending a request to the peer.
+    pub fn request(&self, data: B, t: PacketType) -> (Request<W, B>, Response<R>) {
         let mut ps = self.0.borrow_mut();
 
         let id = ps.next_id();
-        (OutRequest::new(ps.sink.clone(), data, t, id),
-         InResponse::new(ps.stream.key_handle(id * -1)))
+        (Request::new(ps.sink.clone(), data, t, id), Response::new(ps.stream.mcs_handle(id * -1)))
     }
 
     /// Create a bidirectional channel multiplexed over the underlying
@@ -262,16 +270,16 @@ impl<R, W, B> PsOut<R, W, B>
         let mut ps = self.0.borrow_mut();
 
         let id = ps.next_id();
-        (PsSink::new(ps.sink.clone(), id), PsStream::new(ps.stream.key_handle(id * -1)))
+        (PsSink::new(ps.sink.clone(), id), PsStream::new(ps.stream.mcs_handle(id * -1)))
     }
 
     /// Close the packet-stream, indicating that no more packets will be sent.
     ///
     /// This does not immediately close if there are still unfinished
-    /// `OutRequest`s, `OutResponse`s or `PsSink`s. In that case, the closing
+    /// `Request`s, `OutResponse`s or `PsSink`s. In that case, the closing
     /// happens when the last of them finishes.
     ///
-    /// The error contains a `None` if an `OutRequest`, `OutResponse` or
+    /// The error contains a `None` if an `Request`, `OutResponse` or
     /// `PsSink` errored previously.
     pub fn close(self) -> ClosePs<R, W, B> {
         ClosePs(self.0)
@@ -281,10 +289,10 @@ impl<R, W, B> PsOut<R, W, B>
 /// Future for closing the packet-stream, indicating that no more packets will be sent.
 ///
 /// This does not immediately close if there are still unfinished
-/// `OutRequest`s, `OutResponse`s or `PsSink`s. In that case, the closing
+/// `Request`s, `OutResponse`s or `PsSink`s. In that case, the closing
 /// happens when the last of them finishes.
 ///
-/// The error contains a `None` if an `OutRequest`, `OutResponse` or
+/// The error contains a `None` if an `Request`, `OutResponse` or
 /// `PsSink` errored previously.
 pub struct ClosePs<R: AsyncRead, W, B>(Rc<RefCell<Shared<R, W, B>>>);
 
@@ -294,10 +302,10 @@ impl<R, W, B> Future for ClosePs<R, W, B>
           B: AsRef<[u8]>
 {
     type Item = ();
-    type Error = Option<io::Error>;
+    type Error = Option<IoError>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.0.borrow_mut().sink.close()
+    fn poll(&mut self, cx: &mut Context) -> Poll<Self::Item, Self::Error> {
+        self.0.borrow_mut().sink.poll_close(cx)
     }
 }
 
@@ -306,7 +314,7 @@ impl<R, W, B> Future for ClosePs<R, W, B>
 /// The enum variants carry values that allow interacting with the peer.
 pub enum IncomingPacket<R: AsyncRead, W: AsyncWrite, B: AsRef<[u8]>> {
     /// An incoming request. You get an `InRequest`, the peer got an
-    /// `OutRequest` and an `InResponse`.
+    /// `Request` and an `Response`.
     Request(InRequest<W, B>),
     /// A duplex connection initiated by the peer. Both peers get a `PsSink` and
     /// a `PsStream`.
@@ -333,45 +341,44 @@ impl<W, B> Sink for PsSink<W, B>
           B: AsRef<[u8]>
 {
     type SinkItem = (B, Metadata);
-    /// The error contains a `None` if an `OutRequest`, `OutResponse` or
+    /// The error contains a `None` if an `Request`, `OutResponse` or
     /// `PsSink` errored previously.
-    type SinkError = Option<io::Error>;
+    type SinkError = Option<IoError>;
 
-    fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
+    fn poll_ready(&mut self, cx: &mut Context) -> Poll<(), Self::SinkError> {
+        self.sink.poll_ready(cx)
+    }
+
+    fn start_send(&mut self, item: Self::SinkItem) -> Result<(), Self::SinkError> {
         let flags = item.1.flags() | STREAM;
 
-        match self.sink
-                  .start_send((item.0, packet_stream_codec::Metadata { flags, id: self.id })) {
-            Ok(AsyncSink::NotReady((bytes, _))) => Ok(AsyncSink::NotReady((bytes, item.1))),
-            Ok(AsyncSink::Ready) => Ok(AsyncSink::Ready),
-            Err(e) => Err(e),
-        }
+        self.sink
+            .start_send((item.0, CodecMetadata { flags, id: self.id }))
     }
 
-    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
-        self.sink.poll_complete()
+    fn poll_flush(&mut self, cx: &mut Context) -> Poll<(), Self::SinkError> {
+        self.sink.poll_flush(cx)
     }
 
-    fn close(&mut self) -> Poll<(), Self::SinkError> {
-        self.sink.close()
+    fn poll_close(&mut self, cx: &mut Context) -> Poll<(), Self::SinkError> {
+        self.sink.poll_close(cx)
     }
 }
 
 /// An error indicating what happend on a connection.
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+#[derive(Debug)]
 pub enum ConnectionError {
-    /// The peer closed the connection even though this substream was still
-    /// waiting for data.
-    Closed,
-    /// The connection errored.
-    Errored,
+    /// The underlying connection has been closed.
+    ClosedEarly,
+    /// An error occured on reading.
+    Errored(IoError),
 }
 
 impl Display for ConnectionError {
     fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
         match *self {
-            ConnectionError::Closed => write!(f, "ConnectionError::Closed"),
-            ConnectionError::Errored => write!(f, "ConnectionError::Errored"),
+            ConnectionError::ClosedEarly => write!(f, "ConnectionError::Closed"),
+            ConnectionError::Errored(ref err) => write!(f, "ConnectionError::Errored: {}", err),
         }
     }
 }
@@ -379,15 +386,22 @@ impl Display for ConnectionError {
 impl Error for ConnectionError {
     fn description(&self) -> &str {
         match *self {
-            ConnectionError::Closed => "Peer closed its write-half of the packet-stream",
-            ConnectionError::Errored => "An error occuded on the packet-stream",
+            ConnectionError::ClosedEarly => "Peer closed its write-half of the packet-stream",
+            ConnectionError::Errored(ref err) => err.description(),
         }
     }
 }
 
-type StreamHandle<R> = KeyMCS<CodecStream<R>,
-                              PacketId,
-                              fn(&(Box<[u8]>, packet_stream_codec::Metadata)) -> PacketId>;
+impl From<futures_io::Error> for ConnectionError {
+    fn from(err: IoError) -> ConnectionError {
+        ConnectionError::Errored(err)
+    }
+}
+
+type StreamHandle<R> = MCSHandle<CodecStream<R>,
+                                 PacketId,
+                                 fn(&(Box<[u8]>, CodecMetadata)) -> PacketId,
+                                 fn(&IoError) -> PacketId>;
 
 /// The stream half of a duplex multiplexed over the packet-stream.
 pub struct PsStream<R: AsyncRead> {
@@ -409,14 +423,14 @@ impl<R: AsyncRead> Stream for PsStream<R> {
     type Error = ConnectionError;
 
     /// Note that the stream never emits `Ok(None)`.
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        match self.stream.poll() {
-            Ok(Async::Ready(Some((data, codec_metadata)))) => {
-                Ok(Async::Ready((Some((data, Metadata::from_decoded_metadata(codec_metadata))))))
+    fn poll_next(&mut self, cx: &mut Context) -> Poll<Option<Self::Item>, Self::Error> {
+        match self.stream.poll_next(cx) {
+            Ok(Ready(Some((data, codec_metadata)))) => {
+                Ok(Ready((Some((data, Metadata::from_decoded_metadata(codec_metadata))))))
             }
-            Ok(Async::Ready(None)) => Err(ConnectionError::Closed),
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(()) => Err(ConnectionError::Errored),
+            Ok(Ready(None)) => Err(ConnectionError::ClosedEarly),
+            Ok(Pending) => Ok(Pending),
+            Err(err) => Err(err.into()),
         }
     }
 }
@@ -445,59 +459,59 @@ impl<W: AsyncWrite, B: AsRef<[u8]>> InRequest<W, B> {
 /// An outgoing request, initated by this packet-stream.
 ///
 /// Poll it to actually start sending the request.
-pub struct OutRequest<W: AsyncWrite, B: AsRef<[u8]>>(SendClose<MPS<CodecSink<W, B>>>);
+pub struct Request<W: AsyncWrite, B: AsRef<[u8]>>(SendClose<MPS<CodecSink<W, B>>>);
 
-impl<W: AsyncWrite, B: AsRef<[u8]>> OutRequest<W, B> {
+impl<W: AsyncWrite, B: AsRef<[u8]>> Request<W, B> {
     fn new(sink_handle: MPS<CodecSink<W, B>>,
            data: B,
            t: PacketType,
            id: PacketId)
-           -> OutRequest<W, B> {
-        OutRequest(SendClose::new(sink_handle,
-                                  (data,
-                                   packet_stream_codec::Metadata {
-                                       flags: t.flags(),
-                                       id,
-                                   })))
+           -> Request<W, B> {
+        Request(SendClose::new(sink_handle,
+                               (data,
+                                packet_stream_codec::Metadata {
+                                    flags: t.flags(),
+                                    id,
+                                })))
     }
 }
 
-impl<W: AsyncWrite, B: AsRef<[u8]>> Future for OutRequest<W, B> {
+impl<W: AsyncWrite, B: AsRef<[u8]>> Future for Request<W, B> {
     type Item = ();
-    /// The error contains a `None` if an `OutRequest`, `OutResponse` or
+    /// The error contains a `None` if an `Request`, `OutResponse` or
     /// `PsSink` errored previously.
-    type Error = Option<io::Error>;
+    type Error = Option<IoError>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let _ = try_ready!(self.0.poll());
-        Ok(Async::Ready(()))
+    fn poll(&mut self, cx: &mut Context) -> Poll<Self::Item, Self::Error> {
+        let _ = try_ready!(self.0.poll(cx));
+        Ok(Ready(()))
     }
 }
 
 /// A response that will be received from the peer.
-pub struct InResponse<R: AsyncRead>(StreamHandle<R>);
+pub struct Response<R: AsyncRead>(StreamHandle<R>);
 
-impl<R: AsyncRead> InResponse<R> {
-    fn new(stream: StreamHandle<R>) -> InResponse<R> {
-        InResponse(stream)
+impl<R: AsyncRead> Response<R> {
+    fn new(stream: StreamHandle<R>) -> Response<R> {
+        Response(stream)
     }
 }
 
-impl<R: AsyncRead> Future for InResponse<R> {
+impl<R: AsyncRead> Future for Response<R> {
     type Item = (Box<[u8]>, Metadata);
     /// If the peer closes the packet-stream, this emits a
     /// `ConnectionError::Closed`. If an error happens/happened on the underlying
     /// `AsyncRead`, this emits a `ConnectionError::Errored`.
     type Error = ConnectionError;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.0.poll() {
-            Ok(Async::Ready(Some((data, codec_metadata)))) => {
-                Ok(Async::Ready(((data, Metadata::from_decoded_metadata(codec_metadata)))))
+    fn poll(&mut self, cx: &mut Context) -> Poll<Self::Item, Self::Error> {
+        match self.0.poll_next(cx) {
+            Ok(Ready(Some((data, codec_metadata)))) => {
+                Ok(Ready(((data, Metadata::from_decoded_metadata(codec_metadata)))))
             }
-            Ok(Async::Ready(None)) => Err(ConnectionError::Closed),
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(()) => Err(ConnectionError::Errored),
+            Ok(Ready(None)) => Err(ConnectionError::ClosedEarly),
+            Ok(Pending) => Ok(Pending),
+            Err(err) => Err(err.into()),
         }
     }
 }
@@ -519,13 +533,13 @@ impl<W: AsyncWrite, B: AsRef<[u8]>> OutResponse<W, B> {
 
 impl<W: AsyncWrite, B: AsRef<[u8]>> Future for OutResponse<W, B> {
     type Item = ();
-    /// The error contains a `None` if an `OutRequest`, `OutResponse` or
+    /// The error contains a `None` if an `Request`, `OutResponse` or
     /// `PsSink` errored previously.
-    type Error = Option<io::Error>;
+    type Error = Option<IoError>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let _ = try_ready!(self.0.poll());
-        Ok(Async::Ready(()))
+    fn poll(&mut self, cx: &mut Context) -> Poll<Self::Item, Self::Error> {
+        let _ = try_ready!(self.0.poll(cx));
+        Ok(Ready(()))
     }
 }
 
@@ -533,42 +547,16 @@ impl<W: AsyncWrite, B: AsRef<[u8]>> Future for OutResponse<W, B> {
 mod tests {
     use super::*;
 
-    use partial_io::{PartialAsyncRead, PartialAsyncWrite, PartialWithErrors};
-    use partial_io::quickcheck_types::GenInterruptedWouldBlock;
-    use quickcheck::{QuickCheck, StdGen};
     use async_ringbuffer::*;
-    use rand;
-    use futures::stream::iter_ok;
+    use futures::prelude::*;
     use futures::future::ok;
+    use futures::stream::iter_ok;
+    use futures::executor::block_on;
 
     #[test]
-    fn requests() {
-        let rng = StdGen::new(rand::thread_rng(), 20);
-        let mut quickcheck = QuickCheck::new().gen(rng).tests(1000);
-        quickcheck.quickcheck(test_requests as
-                              fn(usize,
-                                 usize,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>)
-                                 -> bool);
-    }
-
-    fn test_requests(buf_size_a: usize,
-                     buf_size_b: usize,
-                     write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-                     read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-                     write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
-                     read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
-                     -> bool {
-        let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
-        let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
-        let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
-
-        let (writer_b, reader_b) = ring_buffer(buf_size_b + 1);
-        let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
-        let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
+    fn test_requests() {
+        let (writer_a, reader_a) = ring_buffer(2);
+        let (writer_b, reader_b) = ring_buffer(2);
 
         let (a_in, a_out, _) = packet_stream(reader_a, writer_b);
         let (b_in, b_out, _) = packet_stream(reader_b, writer_a);
@@ -601,42 +589,17 @@ mod tests {
                             r2_meta.packet_type == PacketType::Binary;
                  });
 
-        return echo.join4(consume_a.map_err(|_| unreachable!()),
-                          send_all.map_err(|_| unreachable!()),
-                          receive_all.map_err(|_| unreachable!()))
-                   .map(|(_, _, _, worked)| worked)
-                   .wait()
-                   .unwrap();
+        assert!(block_on(echo.join4(consume_a.map_err(|_| unreachable!()),
+                                    send_all.map_err(|_| unreachable!()),
+                                    receive_all.map_err(|_| unreachable!()))
+                             .map(|(_, _, _, worked)| assert!(worked)))
+                        .is_ok());
     }
 
     #[test]
-    fn duplexes() {
-        let rng = StdGen::new(rand::thread_rng(), 20);
-        let mut quickcheck = QuickCheck::new().gen(rng).tests(100);
-        quickcheck.quickcheck(test_duplexes as
-                              fn(usize,
-                                 usize,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>)
-                                 -> bool);
-    }
-
-    fn test_duplexes(buf_size_a: usize,
-                     buf_size_b: usize,
-                     write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-                     read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-                     write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
-                     read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
-                     -> bool {
-        let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
-        let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
-        let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
-
-        let (writer_b, reader_b) = ring_buffer(buf_size_b + 1);
-        let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
-        let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
+    fn test_duplexes() {
+        let (writer_a, reader_a) = ring_buffer(2);
+        let (writer_b, reader_b) = ring_buffer(2);
 
         let (a_in, a_out, _) = packet_stream(reader_a, writer_b);
         let (b_in, b_out, _) = packet_stream(reader_b, writer_a);
@@ -649,7 +612,7 @@ mod tests {
                           IncomingPacket::Request(_) => unreachable!(),
                           IncomingPacket::Duplex(sink, stream) => {
                               stream
-                                  .map_err::<Option<io::Error>, _>(|_| None)
+                                  .map_err::<Option<IoError>, _>(|_| None)
                                   .take_while(|&(_, metadata)| ok(!metadata.is_end))
                                   .map(|(data, _)| (data, non_end))
                                   .forward(sink)
@@ -664,18 +627,18 @@ mod tests {
         let (sink1_a, stream1_a) = a_out.duplex();
         let (sink2_a, stream2_a) = a_out.duplex();
 
-        let send_0 = sink0_a.send_all(iter_ok::<_, io::Error>(vec![(vec![0], non_end),
-                                                                   (vec![0], non_end),
-                                                                   (vec![42], end)]));
-        let send_1 = sink1_a.send_all(iter_ok::<_, io::Error>(vec![(vec![1], non_end),
-                                                                   (vec![1], non_end),
-                                                                   (vec![1], non_end),
-                                                                   (vec![43], end)]));
-        let send_2 = sink2_a.send_all(iter_ok::<_, io::Error>(vec![(vec![2], non_end),
-                                                                   (vec![2], non_end),
-                                                                   (vec![2], non_end),
-                                                                   (vec![2], non_end),
-                                                                   (vec![44], end)]));
+        let send_0 = sink0_a.send_all(iter_ok::<_, IoError>(vec![(vec![0], non_end),
+                                                                 (vec![0], non_end),
+                                                                 (vec![42], end)]));
+        let send_1 = sink1_a.send_all(iter_ok::<_, IoError>(vec![(vec![1], non_end),
+                                                                 (vec![1], non_end),
+                                                                 (vec![1], non_end),
+                                                                 (vec![43], end)]));
+        let send_2 = sink2_a.send_all(iter_ok::<_, IoError>(vec![(vec![2], non_end),
+                                                                 (vec![2], non_end),
+                                                                 (vec![2], non_end),
+                                                                 (vec![2], non_end),
+                                                                 (vec![44], end)]));
         let send_all = send_0.join3(send_1, send_2).and_then(|_| a_out.close());
 
         let receive_0 = stream0_a
@@ -693,11 +656,10 @@ mod tests {
             .join3(receive_1, receive_2)
             .map(|(a, b, c)| a && b && c);
 
-        return echo.join4(consume_a.map_err(|_| unreachable!()),
-                          send_all.map_err(|_| unreachable!()),
-                          receive_all.map_err(|_| unreachable!()))
-                   .map(|(_, _, _, worked)| worked)
-                   .wait()
-                   .unwrap();
+        assert!(block_on(echo.join4(consume_a.map_err(|_| unreachable!()),
+                                    send_all.map_err(|_| unreachable!()),
+                                    receive_all.map_err(|_| unreachable!()))
+                             .map(|(_, _, _, worked)| assert!(worked)))
+                        .is_ok());
     }
 }

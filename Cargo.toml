@@ -8,17 +8,16 @@ readme = "README.md"
 license = "AGPL-3.0"
 
 [dependencies]
-futures = "0.1.17"
-tokio-io = "0.1.4"
-atm-io-utils = "0.1.0"
-atm-async-utils = "0.1.2"
-void = "1.0.2"
-multi-producer-sink = "0.3.0"
-multi-consumer-stream = "0.3.0"
-packet-stream-codec = "0.1.0"
+atm-async-utils = "0.2.1"
+futures-core = "0.2.0-alpha"
+futures-io = "0.2.0-alpha"
+futures-sink = "0.2.0-alpha"
+futures-util = "0.2.0-alpha"
+futures-executor = "0.2.0-alpha"
+multi-producer-sink = "0.4.0"
+multi-consumer-stream = "0.4.0"
+packet-stream-codec = "0.2.0"
 
 [dev-dependencies]
-partial-io = { version = "0.2.5", features = ["quickcheck", "tokio"] }
-quickcheck = "0.4.1"
-async-ringbuffer = "0.1.0"
-rand = "0.3.18"
+futures = "0.2.0-alpha"
+async-ringbuffer = "0.3.0"
