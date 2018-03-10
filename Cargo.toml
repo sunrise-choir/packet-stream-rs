@@ -1,6 +1,6 @@
 [package]
 name = "packet-stream"
-version = "0.6.0"
+version = "0.7.0"
 authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
 description = "Implementation of the packet-stream multiplexing protocol in Rust."
 repository = "https://github.com/AljoschaMeyer/packet-stream-rs"
