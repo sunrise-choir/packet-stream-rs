@@ -218,7 +218,7 @@ impl<R, W, B> Shared<R, W, B>
                     } else {
                         Ok(Ready(Some((data,
                                        Metadata::from_decoded_metadata(metadata),
-                                       IncomingPacket::Request(InRequest::new(self.sink
+                                       IncomingPacket::Request(PeerRequest::new(self.sink
                                                                                   .clone(),
                                                                               metadata.id))))))
                     }
@@ -275,10 +275,10 @@ impl<R, W, B> PsOut<R, W, B>
     /// Close the packet-stream, indicating that no more packets will be sent.
     ///
     /// This does not immediately close if there are still unfinished
-    /// `Request`s, `OutResponse`s or `PsSink`s. In that case, the closing
+    /// `Request`s, `PeerResponse`s or `PsSink`s. In that case, the closing
     /// happens when the last of them finishes.
     ///
-    /// The error contains a `None` if an `Request`, `OutResponse` or
+    /// The error contains a `None` if an `Request`, `PeerResponse` or
     /// `PsSink` errored previously.
     pub fn close(self) -> ClosePs<R, W, B> {
         ClosePs(self.0)
@@ -288,10 +288,10 @@ impl<R, W, B> PsOut<R, W, B>
 /// Future for closing the packet-stream, indicating that no more packets will be sent.
 ///
 /// This does not immediately close if there are still unfinished
-/// `Request`s, `OutResponse`s or `PsSink`s. In that case, the closing
+/// `Request`s, `PeerResponse`s or `PsSink`s. In that case, the closing
 /// happens when the last of them finishes.
 ///
-/// The error contains a `None` if an `Request`, `OutResponse` or
+/// The error contains a `None` if an `Request`, `PeerResponse` or
 /// `PsSink` errored previously.
 pub struct ClosePs<R: AsyncRead, W, B>(Rc<RefCell<Shared<R, W, B>>>);
 
@@ -312,9 +312,9 @@ impl<R, W, B> Future for ClosePs<R, W, B>
 ///
 /// The enum variants carry values that allow interacting with the peer.
 pub enum IncomingPacket<R: AsyncRead, W: AsyncWrite, B: AsRef<[u8]>> {
-    /// An incoming request. You get an `InRequest`, the peer got an
+    /// An incoming request. You get an `PeerRequest`, the peer got a
     /// `Request` and an `Response`.
-    Request(InRequest<W, B>),
+    Request(PeerRequest<W, B>),
     /// A duplex connection initiated by the peer. Both peers get a `PsSink` and
     /// a `PsStream`.
     Duplex(PsSink<W, B>, PsStream<R>),
@@ -340,7 +340,7 @@ impl<W, B> Sink for PsSink<W, B>
           B: AsRef<[u8]>
 {
     type SinkItem = (B, Metadata);
-    /// The error contains a `None` if an `Request`, `OutResponse` or
+    /// The error contains a `None` if an `Request`, `PeerResponse` or
     /// `PsSink` errored previously.
     type SinkError = Option<IoError>;
 
@@ -436,22 +436,22 @@ impl<R: AsyncRead> Stream for PsStream<R> {
 
 /// A request initated by the peer. Drop to ignore it, or use `respond` to send
 /// a response.
-pub struct InRequest<W, B> {
+pub struct PeerRequest<W, B> {
     sink: MPS<CodecSink<W, B>>,
     id: PacketId,
 }
 
-impl<W, B> InRequest<W, B> {
-    fn new(sink: MPS<CodecSink<W, B>>, id: PacketId) -> InRequest<W, B> {
-        InRequest { sink, id }
+impl<W, B> PeerRequest<W, B> {
+    fn new(sink: MPS<CodecSink<W, B>>, id: PacketId) -> PeerRequest<W, B> {
+        PeerRequest { sink, id }
     }
 }
 
-impl<W: AsyncWrite, B: AsRef<[u8]>> InRequest<W, B> {
+impl<W: AsyncWrite, B: AsRef<[u8]>> PeerRequest<W, B> {
     /// Returns a Future which completes once the given packet has been sent to
     /// the peer.
-    pub fn respond(self, data: B, metadata: Metadata) -> OutResponse<W, B> {
-        OutResponse::new(self.sink, self.id * -1, data, metadata)
+    pub fn respond(self, data: B, metadata: Metadata) -> PeerResponse<W, B> {
+        PeerResponse::new(self.sink, self.id * -1, data, metadata)
     }
 }
 
@@ -477,7 +477,7 @@ impl<W: AsyncWrite, B: AsRef<[u8]>> Request<W, B> {
 
 impl<W: AsyncWrite, B: AsRef<[u8]>> Future for Request<W, B> {
     type Item = ();
-    /// The error contains a `None` if an `Request`, `OutResponse` or
+    /// The error contains a `None` if an `Request`, `PeerResponse` or
     /// `PsSink` errored previously.
     type Error = Option<IoError>;
 
@@ -516,23 +516,23 @@ impl<R: AsyncRead> Future for Response<R> {
 }
 
 /// Future that completes when the response has been sent to the peer.
-pub struct OutResponse<W: AsyncWrite, B: AsRef<[u8]>>(SendClose<MPS<CodecSink<W, B>>>);
+pub struct PeerResponse<W: AsyncWrite, B: AsRef<[u8]>>(SendClose<MPS<CodecSink<W, B>>>);
 
-impl<W: AsyncWrite, B: AsRef<[u8]>> OutResponse<W, B> {
+impl<W: AsyncWrite, B: AsRef<[u8]>> PeerResponse<W, B> {
     fn new(sink: MPS<CodecSink<W, B>>,
            id: PacketId,
            data: B,
            metadata: Metadata)
-           -> OutResponse<W, B> {
+           -> PeerResponse<W, B> {
         debug_assert!(id < 0);
 
-        OutResponse(SendClose::new(sink, (data, metadata.to_codec_metadata(id))))
+        PeerResponse(SendClose::new(sink, (data, metadata.to_codec_metadata(id))))
     }
 }
 
-impl<W: AsyncWrite, B: AsRef<[u8]>> Future for OutResponse<W, B> {
+impl<W: AsyncWrite, B: AsRef<[u8]>> Future for PeerResponse<W, B> {
     type Item = ();
-    /// The error contains a `None` if an `Request`, `OutResponse` or
+    /// The error contains a `None` if an `Request`, `PeerResponse` or
     /// `PsSink` errored previously.
     type Error = Option<IoError>;
 
