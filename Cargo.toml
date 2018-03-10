@@ -5,7 +5,7 @@ authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
 description = "Implementation of the packet-stream multiplexing protocol in Rust."
 repository = "https://github.com/AljoschaMeyer/packet-stream-rs"
 readme = "README.md"
-license = "GPL-3.0"
+license = "AGPL-3.0"
 
 [dependencies]
 futures = "0.1.17"
